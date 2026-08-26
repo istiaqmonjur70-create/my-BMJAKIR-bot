@@ -42,9 +42,9 @@ YOUR_USERNAME = "@Bmjakir69"
 UPDATE_CHANNEL = "https://t.me/JAKIRLABS"
 UPLOAD_LOG_CHANNEL = "@ajajakkalqkqkqjajakl" # ফাইল আপলোড নোটিফিকেশন চ্যানেল
 
-# পেমেন্ট রিসিভ করার নাম্বার (এখানে আপনার নাম্বার দিন)
-BKASH_NUMBER = "01612037086" 
-NAGAD_NUMBER = "Off" 
+# Default payment numbers (Can be changed from Admin Panel now)
+DEFAULT_BKASH = "01612037086"
+DEFAULT_NAGAD = "Off"
 
 # Folder setup - using absolute paths
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -202,31 +202,8 @@ def set_setting(key, value):
         conn.commit()
         conn.close()
 
-# --- Security Functions ---
-def block_and_alert_user(user_id, user_name, reason):
-    if user_id in admin_ids:
-        return
-        
-    blocked_users.add(user_id)
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO blocked_users (user_id) VALUES (?)", (user_id,))
-        conn.commit()
-        conn.close()
-        
-    alert_msg = (
-        f"🚨 **SECURITY ALERT: USER BLOCKED!** 🚨\n\n"
-        f"👤 **Name:** {user_name}\n"
-        f"🆔 **User ID:** `{user_id}`\n"
-        f"❌ **Reason:** `{reason}`\n\n"
-        f"⚠️ *এই ইউজারকে বট থেকে স্বয়ংক্রিয়ভাবে ব্লক করা হয়েছে!*"
-    )
-    try:
-        bot.send_message(OWNER_ID, alert_msg, parse_mode="Markdown")
-        bot.send_message(user_id, "🚫 **আপনাকে বট থেকে স্থায়ীভাবে ব্লক করা হয়েছে!**\nকারণ: ক্ষতিকর ফাইল বা কমান্ড দেওয়ার চেষ্টা।", protect_content=True)
-    except:
-        pass
+# --- Security Functions (No User Block for Files) ---
+# Removed block_and_alert_user for file uploads, only manual blocks use it now.
 
 # --- Limits & Plans Helper ---
 def get_user_file_limit(user_id):
@@ -290,30 +267,32 @@ def check_force_sub(user_id):
             if member.status in ['left', 'kicked', 'restricted']:
                 not_joined.append((ch_id, ch_url))
         except Exception as e:
-            logger.warning(f"Force Sub error for {user_id} in {ch_id}: {e}")
             pass
             
     return not_joined
 
 # --- Malware & Anti-Theft Check ---
-MALWARE_SIGNATURES = [b"MZ", b"\x7fELF", b"\xfe\xed\xfa", b"\xce\xfa\xed\xfe", b"PK", b"Rar!"]
+# Only severe threats block the file (not the user).
+MALWARE_SIGNATURES = [b"MZ", b"\x7fELF", b"PK", b"Rar!"]
 SUSPICIOUS_KEYWORDS = [
-    b"ransomware", b"trojan", b"virus", b"malware", b"backdoor", 
-    b"botnet", b"keylogger", b"../", b"..\\", b"bot_data.db"
+    b"bot_data.db"  # Prevent direct theft of the DB. 
 ]
 
 def is_suspicious_file(file_content, file_name):
     file_lower = file_name.lower()
     suspicious_extensions = [".exe", ".dll", ".bat", ".cmd", ".scr", ".com", ".pif", ".msi", ".jar", ".apk"]
     if any(file_lower.endswith(ext) for ext in suspicious_extensions):
-        return True, f"Suspicious file extension: {file_name}"
+        return True, f"🚫 আপনার ফাইলে ক্ষতিকর এক্সটেনশন রয়েছে ({file_name})।"
+    
     for signature in MALWARE_SIGNATURES:
         if file_content.startswith(signature):
-            return True, f"Malware signature detected"
+            return True, f"🚫 আপনার ফাইলটিতে ম্যালওয়্যার/বাইনারি (Malware Signature) কোড শনাক্ত হয়েছে।"
+            
     sample_text = file_content[:4096].decode("utf-8", errors="ignore").lower()
     for keyword in SUSPICIOUS_KEYWORDS:
         if keyword in sample_text.encode("utf-8", errors="ignore"):
-            return True, f"Security Violation: {keyword.decode('utf-8')} found. Trying to steal data or hack."
+            return True, f"🚫 ক্ষতিকর কমান্ড পাওয়া গেছে: `{keyword.decode('utf-8')}`. এটি ব্যবহার থেকে বিরত থাকুন।"
+            
     return False, "Safe"
 
 # --- Process Helpers ---
@@ -390,7 +369,7 @@ def force_kill_user_bot(owner_id, file_name):
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
     except Exception as e:
-        logger.error(f"Force kill OS error: {e}")
+        pass
 
 def is_bot_running(script_owner_id, file_name):
     script_key = f"{script_owner_id}_{file_name}"
@@ -420,7 +399,7 @@ def is_bot_running(script_owner_id, file_name):
         
     return False
 
-# --- Background auto-stopper ---
+# --- Background auto-stopper (with Extend feature) ---
 def auto_stopper():
     while True:
         time.sleep(60)
@@ -429,12 +408,26 @@ def auto_stopper():
             script = bot_scripts.get(key)
             if not script: continue
             user_id = script["script_owner_id"]
+            
             if user_id not in admin_ids and not is_vip_user(user_id):
                 elapsed_hours = (now - script["start_time"]).total_seconds() / 3600
-                if elapsed_hours >= 12:
+                
+                # ১১ ঘন্টা পার হলে ওয়ার্নিং দিবে (যদি আগে না দেওয়া হয়ে থাকে)
+                if elapsed_hours >= 11 and not script.get("warning_sent"):
+                    script["warning_sent"] = True
+                    markup = types.InlineKeyboardMarkup()
+                    markup.add(types.InlineKeyboardButton("⏳ Extend Time (Deploy +12h)", callback_data=f"extend_{user_id}_{script['file_name']}"))
+                    
+                    try:
+                        bot.send_message(user_id, f"⚠️ **সতর্কতা!**\nআপনার `{script['file_name']}` বোটটি আর মাত্র ১ ঘণ্টা পর স্বয়ংক্রিয়ভাবে বন্ধ হয়ে যাবে।\nসময় বাড়াতে নিচের বাটনে ক্লিক করুন।", reply_markup=markup)
+                    except:
+                        pass
+                
+                # ১২ ঘন্টা পার হলে বটটি বন্ধ করে দিবে
+                elif elapsed_hours >= 12:
                     force_kill_user_bot(user_id, script["file_name"])
                     try:
-                        bot.send_message(user_id, f"⏱️ **আপনার ১২ ঘণ্টার ফ্রি লিমিট শেষ!**\n📄 `{script['file_name']}` বোটটি স্বয়ংক্রিয়ভাবে বন্ধ করা হয়েছে। আনলিমিটেড রান টাইমের জন্য VIP Plan কিনুন।", protect_content=True)
+                        bot.send_message(user_id, f"🛑 **আপনার ১২ ঘণ্টার ফ্রি লিমিট শেষ!**\n📄 `{script['file_name']}` বোটটি স্বয়ংক্রিয়ভাবে বন্ধ করা হয়েছে।\nআবার রান করতে Manage Files থেকে Start করুন।", protect_content=True)
                     except:
                         pass
 
@@ -476,7 +469,7 @@ def subscription_checker():
                         pass
             conn.close()
         except Exception as e:
-            logger.error(f"Subscription Checker Error: {e}")
+            pass
 
 threading.Thread(target=subscription_checker, daemon=True).start()
 
@@ -532,7 +525,7 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
         
         process = subprocess.Popen([sys.executable, "-u", script_path], cwd=user_folder, stdout=log_file, stderr=log_file, stdin=subprocess.PIPE, env=custom_env)
         
-        bot_scripts[script_key] = {"process": process, "log_file": log_file, "file_name": file_name, "script_owner_id": script_owner_id, "start_time": datetime.now(), "user_folder": user_folder, "type": "py"}
+        bot_scripts[script_key] = {"process": process, "log_file": log_file, "file_name": file_name, "script_owner_id": script_owner_id, "start_time": datetime.now(), "warning_sent": False, "user_folder": user_folder, "type": "py"}
         bot.send_message(message_obj_for_reply.chat.id, f"🚀 **Python Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=True)
         threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply)).start()
     except Exception as e:
@@ -556,7 +549,7 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
         
         process = subprocess.Popen(["node", script_path], cwd=user_folder, stdout=log_file, stderr=log_file, stdin=subprocess.PIPE, env=custom_env)
         
-        bot_scripts[script_key] = {"process": process, "log_file": log_file, "file_name": file_name, "script_owner_id": script_owner_id, "start_time": datetime.now(), "user_folder": user_folder, "type": "js"}
+        bot_scripts[script_key] = {"process": process, "log_file": log_file, "file_name": file_name, "script_owner_id": script_owner_id, "start_time": datetime.now(), "warning_sent": False, "user_folder": user_folder, "type": "js"}
         bot.send_message(message_obj_for_reply.chat.id, f"🚀 **JS Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=True)
         threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply)).start()
     except Exception as e:
@@ -630,6 +623,11 @@ def create_admin_panel_inline(user_id):
         types.InlineKeyboardButton("➕ 𝗔𝗱𝗱 𝗖𝗵𝗮𝗻𝗻𝗲𝗹", callback_data="add_channel"),
         types.InlineKeyboardButton("➖ 𝗥𝗲𝗺𝗼𝘃𝗲 𝗖𝗵𝗮𝗻𝗻𝗲𝗹", callback_data="remove_channel")
     )
+    # New Buttons for Number setup
+    markup.add(
+        types.InlineKeyboardButton("⚙️ 𝗦𝗲𝘁 𝗯𝗞𝗮𝘀𝗵 𝗡𝘂𝗺𝗯𝗲𝗿", callback_data="set_bkash"),
+        types.InlineKeyboardButton("⚙️ 𝗦𝗲𝘁 𝗡𝗮𝗴𝗮𝗱 𝗡𝘂𝗺𝗯𝗲𝗿", callback_data="set_nagad")
+    )
     markup.add(
         types.InlineKeyboardButton("📣 𝗕𝗿𝗼𝗮𝗱𝗰𝗮𝘀𝘁", callback_data="broadcast"),
         types.InlineKeyboardButton("🔐 𝗟𝗼𝗰𝗸/𝗨𝗻𝗹𝗼𝗰𝗸", callback_data="toggle_lock")
@@ -648,7 +646,7 @@ def create_admin_panel_inline(user_id):
             types.InlineKeyboardButton("➖ 𝗥𝗲𝗺𝗼𝘃𝗲 𝗔𝗱𝗺𝗶𝗻", callback_data="remove_admin")
         )
         markup.add(
-            types.InlineKeyboardButton("⚙️ 𝗦𝗲𝘁 𝗕𝗼𝘁 𝗟𝗶𝗺𝗶𝘁 (Manual)", callback_data="set_limit"),
+            types.InlineKeyboardButton("⚙️ 𝗦𝗲𝘁 𝗕𝗼𝘁 𝗟𝗶𝗺𝗶𝘁", callback_data="set_limit"),
             types.InlineKeyboardButton("🚫 𝗕𝗹𝗼𝗰𝗸 𝗨𝘀𝗲𝗿", callback_data="block_user")
         )
         markup.add(
@@ -674,7 +672,6 @@ def start_cmd(message):
 
     add_active_user(user_id)
     
-    # Check and insert into user_account, handle referral
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
@@ -825,10 +822,10 @@ def handle_file_upload_doc(message):
         if user_id not in admin_ids:
             is_suspicious, reason = is_suspicious_file(downloaded_file, file_name)
             if is_suspicious:
-                try:
-                    bot.delete_message(message.chat.id, download_wait_msg.message_id)
+                try: bot.delete_message(message.chat.id, download_wait_msg.message_id)
                 except: pass
-                block_and_alert_user(user_id, user_name, reason)
+                # সুধু ফাইল রিজেক্ট করবে, ইউজারকে ব্লক করবে না।
+                bot.send_message(message.chat.id, f"❌ **ফাইলটি আপলোড করা সম্ভব হয়নি!**\n\nকারণ: {reason}\nদয়া করে ফাইলে থাকা ক্ষতিকর অংশ সরিয়ে আবার আপলোড করুন।", parse_mode="Markdown")
                 return
 
         user_folder = get_user_folder(user_id)
@@ -864,7 +861,7 @@ def handle_file_upload_doc(message):
         bot.send_message(message.chat.id, f"❌ **Error:** {str(e)}")
 
 
-# --- Callback Routing (Secured) ---
+# --- Callback Routing ---
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
     user_id = call.from_user.id
@@ -874,7 +871,7 @@ def handle_callbacks(call):
     global bot_locked
     data = call.data
 
-    if data.startswith(("file_", "start_", "verify_", "stop_", "del_", "instmod_", "viewlog_")):
+    if data.startswith(("file_", "start_", "verify_", "stop_", "del_", "instmod_", "viewlog_", "extend_")):
         parts = data.split("_")
         owner_id = int(parts[1])
         if user_id != owner_id and user_id not in admin_ids:
@@ -933,7 +930,11 @@ def handle_callbacks(call):
             return
         temp_deposit[user_id]["method"] = method
         
-        number = BKASH_NUMBER if method == "bkash" else NAGAD_NUMBER
+        # Get Dynamic Numbers
+        bkash_no = get_setting("bkash_number", DEFAULT_BKASH)
+        nagad_no = get_setting("nagad_number", DEFAULT_NAGAD)
+        
+        number = bkash_no if method == "bkash" else nagad_no
         method_name = "বিকাশ (bKash)" if method == "bkash" else "নগদ (Nagad)"
         
         msg = bot.send_message(call.message.chat.id, 
@@ -969,7 +970,21 @@ def handle_callbacks(call):
         try: bot.send_message(target_uid, f"❌ **আপনার {amount} BDT ডিপোজিট রিকোয়েস্ট বাতিল করা হয়েছে।**\nপ্রয়োজনে এডমিনের সাথে যোগাযোগ করুন।")
         except: pass
 
-    # --- Other Callbacks ---
+    # --- File & Time Extension Logic ---
+    elif data.startswith("extend_"):
+        parts = data.split("_", 2)
+        uid = int(parts[1])
+        fname = parts[2]
+        skey = f"{uid}_{fname}"
+        
+        if skey in bot_scripts:
+            bot_scripts[skey]["start_time"] = datetime.now()
+            bot_scripts[skey]["warning_sent"] = False
+            bot.answer_callback_query(call.id, "✅ টাইম আরো ১২ ঘণ্টা বাড়ানো হয়েছে!", show_alert=True)
+            bot.edit_message_text(f"✅ **টাইম বাড়ানো হয়েছে!**\nআপনার `{fname}` বোটটি পুনরায় রিনিউ করা হয়েছে এবং এটি আরো ১২ ঘণ্টা চলবে।", call.message.chat.id, call.message.message_id)
+        else:
+            bot.answer_callback_query(call.id, "❌ বোটটি বর্তমানে চলছে না!", show_alert=True)
+
     elif data.startswith("file_"):
         _, owner_id, fname = data.split("_", 2)
         is_running = is_bot_running(int(owner_id), fname)
@@ -1005,16 +1020,13 @@ def handle_callbacks(call):
         if not_joined:
             bot.answer_callback_query(call.id, "❌ আপনি এখনো সব চ্যানেলে জয়েন করেননি!", show_alert=True)
         else:
-            try:
-                bot.delete_message(call.message.chat.id, call.message.message_id)
-            except:
-                pass
+            try: bot.delete_message(call.message.chat.id, call.message.message_id)
+            except: pass
             do_start_bot(owner_id, fname, call.message, call.id)
 
     elif data.startswith("stop_"):
         _, owner_id, fname = data.split("_", 2)
         force_kill_user_bot(owner_id, fname)
-        
         bot.answer_callback_query(call.id, "Stopped!")
         bot.send_message(call.message.chat.id, f"🛑 Script `{fname}` stopped successfully.", parse_mode="Markdown")
 
@@ -1060,6 +1072,15 @@ def handle_callbacks(call):
             bot.send_message(call.message.chat.id, f"📜 **Logs:**\n\n```\n{logs if logs else 'No logs'}\n```", parse_mode="Markdown", protect_content=True)
         else:
             bot.answer_callback_query(call.id, "No logs!", show_alert=True)
+
+    # --- Settings Handlers ---
+    elif data == "set_bkash" and user_id in admin_ids:
+        msg = bot.send_message(call.message.chat.id, "📝 **বিকাশ পেমেন্ট নাম্বার দিন:**")
+        bot.register_next_step_handler(msg, process_set_bkash)
+
+    elif data == "set_nagad" and user_id in admin_ids:
+        msg = bot.send_message(call.message.chat.id, "📝 **নগদ পেমেন্ট নাম্বার দিন:**")
+        bot.register_next_step_handler(msg, process_set_nagad)
 
     # --- VIP Plans Admin Panel Callbacks ---
     elif data == "add_plan" and user_id in admin_ids:
@@ -1254,6 +1275,14 @@ def process_deposit_trx(message):
     bot.send_message(OWNER_ID, admin_msg, reply_markup=markup, parse_mode="Markdown")
     bot.send_message(message.chat.id, "⏳ **আপনার ডিপোজিট রিকোয়েস্ট এডমিনের কাছে পাঠানো হয়েছে। খুব শীঘ্রই এপ্রুভ হয়ে যাবে।**")
 
+# --- Setting Process Handlers ---
+def process_set_bkash(message):
+    set_setting("bkash_number", message.text.strip())
+    bot.send_message(message.chat.id, f"✅ **বিকাশ নাম্বার সেট করা হয়েছে:** {message.text.strip()}", parse_mode="Markdown")
+
+def process_set_nagad(message):
+    set_setting("nagad_number", message.text.strip())
+    bot.send_message(message.chat.id, f"✅ **নগদ নাম্বার সেট করা হয়েছে:** {message.text.strip()}", parse_mode="Markdown")
 
 # --- Plan Creation Process Handlers ---
 admin_plan_temp = {}
@@ -1403,13 +1432,24 @@ def process_set_limit_value(message, target_user):
         bot.send_message(message.chat.id, "❌ ভুল লিমিট! সঠিক সংখ্যা দিন।")
 
 def process_manual_block(message):
+    # Only block using admin panel manual block now
     try:
         target_user = int(message.text.strip())
         if target_user in admin_ids:
             bot.send_message(message.chat.id, "❌ অ্যাডমিনকে ব্লক করা যাবে না!")
             return
-        block_and_alert_user(target_user, "Manual Block", "অ্যাডমিন ম্যানুয়ালি ব্লক করেছেন")
+        
+        blocked_users.add(target_user)
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute("INSERT OR IGNORE INTO blocked_users (user_id) VALUES (?)", (target_user,))
+            conn.commit()
+            conn.close()
+            
         bot.send_message(message.chat.id, f"✅ `{target_user}` কে সফলভাবে ব্লক করা হয়েছে।")
+        try: bot.send_message(target_user, "🚫 **আপনাকে বট থেকে স্থায়ীভাবে ব্লক করা হয়েছে!**\nকারণ: এডমিন রুলস ভঙ্গের কারণে ব্লক করেছেন।")
+        except: pass
     except ValueError:
         bot.send_message(message.chat.id, "❌ ভুল User ID! সঠিক সংখ্যা দিন।")
 
