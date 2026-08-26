@@ -159,7 +159,7 @@ def set_setting(key, value):
         conn.commit()
         conn.close()
 
-# --- Security Functions (Manual Block system intact) ---
+# --- Security Functions ---
 def block_and_alert_user(user_id, user_name, reason):
     if user_id in admin_ids:
         return
@@ -681,7 +681,7 @@ def _logic_tutorial(message):
     bot.send_message(message.chat.id, msg, reply_markup=markup, parse_mode="Markdown", protect_content=True)
 
 
-# --- File Upload Handler (With User Friendly File Blocking Security Check) ---
+# --- File Upload Handler (With Strict Security Checks) ---
 @bot.message_handler(content_types=["document"])
 def handle_file_upload_doc(message):
     user_id = message.from_user.id
@@ -713,36 +713,14 @@ def handle_file_upload_doc(message):
         file_info = bot.get_file(doc.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
 
-        # সার্ভার হ্যাক বা ক্ষতিকর কোড ডিটেকশন
+        # সার্ভার হ্যাক বা ক্ষতিকর কোড ডিটেকশন (Admin দের ক্ষেত্রেও স্ক্যান করবে যাতে ভুলের কারণে সার্ভার ডাউন না হয়)
         is_suspicious, reason = is_suspicious_file(downloaded_file, file_name)
         if is_suspicious:
             try:
                 bot.delete_message(message.chat.id, download_wait_msg.message_id)
             except: pass
-            
-            # ইউজারকে ব্লক না করে শুধু ফাইল ব্লক করা হচ্ছে এবং ইউজারকে ওয়ার্নিং মেসেজ দেওয়া হচ্ছে
-            warning_msg = (
-                f"🚫 **আপনার ফাইলটি সিকিউরিটি চেকে ব্লক করা হয়েছে!** 🚫\n\n"
-                f"📄 **File Name:** `{file_name}`\n"
-                f"❌ **সমস্যা (Reason):** `{reason}`\n\n"
-                f"⚠️ *দয়া করে আপনার কোড থেকে উপরের ক্ষতিকর অংশটি (keyword বা extension) মুছে ফেলুন বা ঠিক করুন এবং পুনরায় আপলোড করুন।*"
-            )
-            bot.send_message(user_id, warning_msg, parse_mode="Markdown")
-            
-            # অ্যাডমিনের কাছে অ্যালার্ট পাঠানো হচ্ছে কিন্তু ইউজার ব্লক হচ্ছে না
-            alert_msg = (
-                f"⚠️ **SECURITY ALERT: SUSPICIOUS FILE BLOCKED!** ⚠️\n\n"
-                f"👤 **Name:** {user_name}\n"
-                f"🆔 **User ID:** `{user_id}`\n"
-                f"📄 **File:** `{file_name}`\n"
-                f"❌ **Reason:** `{reason}`"
-            )
-            try:
-                bot.send_message(OWNER_ID, alert_msg, parse_mode="Markdown")
-            except:
-                pass
-                
-            return # ফাইল সেভ না করেই রিটার্ন করে দিবে
+            block_and_alert_user(user_id, user_name, reason)
+            return
 
         user_folder = get_user_folder(user_id)
         file_path = os.path.join(user_folder, file_name)
