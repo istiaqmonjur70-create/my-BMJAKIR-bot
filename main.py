@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 import hashlib
-from flask import Flask
+from flask import Flask3
 from threading import Thread
 import psutil
 import telebot
@@ -36,7 +36,7 @@ def keep_alive():
 
 # --- Configuration ---
 TOKEN = "8627005003:AAG1-Q90g4z5SME-WOeYvfrfQmmuMR7h3k0"
-OWNER_ID = 8814363793
+OWNER_ID = 881436379
 ADMIN_ID = 8814363793
 YOUR_USERNAME = "@Bmjakir69"
 UPDATE_CHANNEL = "https://t.me/JAKIRLABS"
@@ -181,7 +181,7 @@ def block_and_alert_user(user_id, user_name, reason):
     )
     try:
         bot.send_message(OWNER_ID, alert_msg, parse_mode="Markdown")
-        bot.send_message(user_id, "🚫 **আপনাকে সার্ভার হ্যাক বা ক্ষতিকর কোড আপলোড করার কারণে স্থায়ীভাবে ব্লক করা হয়েছে!**", protect_content=True)
+        bot.send_message(user_id, "🚫 **আপনাকে সার্ভার হ্যাক বা ক্ষতিকর কোড আপলোড করার কারণে স্থায়ীভাবে ব্লক করা হয়েছে!**\nআপনার আপলোড করা ফাইলটি স্বয়ংক্রিয়ভাবে মুছে ফেলা হয়েছে।", protect_content=True)
     except:
         pass
 
@@ -245,35 +245,43 @@ def check_force_sub(user_id):
             
     return not_joined
 
-# --- Advanced Server Security & Anti-Hack Check ---
+# --- ADVANCED Server Security & Anti-Hack Check ---
 MALWARE_SIGNATURES = [b"MZ", b"\x7fELF", b"\xfe\xed\xfa", b"\xce\xfa\xed\xfe", b"PK", b"Rar!"]
 
-# সার্ভার ডাউন, হ্যাকিং, ডেটা চুরির ক্ষতিকর কিওয়ার্ড এবং কমান্ড ফিল্টার
+# সার্ভার ধ্বংসকারী কোডগুলোর হার্ডকোর ফিল্টার
 DANGEROUS_KEYWORDS = [
-    b"ransomware", b"trojan", b"virus", b"malware", b"backdoor", 
-    b"botnet", b"keylogger", b"../", b"..\\", b"bot_data.db",
-    b"os.system", b"subprocess.call", b"subprocess.Popen", b"shutil.rmtree",
-    b"socket.socket", b"urllib.request", b"requests.get", b"requests.post",
-    b"eval(", b"exec(", b"__import__", b"pickle.loads", b"ctypes",
-    b"fork()", b"while True:", b"while(1):", b"child_process", b"require('child_process')"
+    b"os.system", b"subprocess", b"shutil.rmtree", b"eval(", b"exec(", 
+    b"__import__", b"pty.spawn", b"os.popen", b"os.execl", b"os.execv",
+    b"child_process", b"execSync", b"spawnSync", b"require('child_process')",
+    b"fs.rmdirSync", b"fs.unlinkSync", b"rm -rf", b"bot_data.db", 
+    b"import pty", b"from pty import", b"import subprocess", b"from subprocess import"
 ]
 
 def is_suspicious_file(file_content, file_name):
     file_lower = file_name.lower()
-    suspicious_extensions = [".exe", ".dll", ".bat", ".cmd", ".scr", ".com", ".pif", ".msi", ".jar", ".apk", ".sh"]
+    suspicious_extensions = [".exe", ".dll", ".bat", ".cmd", ".scr", ".com", ".pif", ".msi", ".jar", ".apk", ".sh", ".php", ".bin"]
     if any(file_lower.endswith(ext) for ext in suspicious_extensions):
         return True, f"Suspicious file extension: {file_name}"
         
     for signature in MALWARE_SIGNATURES:
         if file_content.startswith(signature):
-            return True, f"Malware signature detected"
+            return True, f"Malware signature detected in binary format"
             
-    # কোডের সম্পূর্ণ কন্টেন্ট চেক করা যাতে সার্ভার হ্যাক বা ক্রাশ করার কোড থাকলে ধরে ফেলে
+    # ফাইল কন্টেন্ট বিশ্লেষণ
     try:
         sample_text = file_content.decode("utf-8", errors="ignore").lower()
+        
+        # ১. ডাইরেক্ট কিওয়ার্ড চেকিং
         for keyword in DANGEROUS_KEYWORDS:
-            if keyword.decode('utf-8') in sample_text:
-                return True, f"Security Violation: Dangerous code/keyword detected -> {keyword.decode('utf-8')}"
+            if keyword.decode('utf-8').lower() in sample_text:
+                return True, f"High-Risk Command Detected: {keyword.decode('utf-8')}"
+                
+        # ২. ডাইনামিক ইম্পোর্ট চেকিং (Regular Expression দিয়ে লুকানো কোড ধরা)
+        dangerous_py_modules = r"(subprocess|pty|shutil)"
+        py_import_pattern = re.compile(fr"^\s*(import|from)\s+{dangerous_py_modules}\b", re.MULTILINE)
+        if py_import_pattern.search(sample_text):
+            return True, "Restricted Python module import detected"
+
     except Exception as e:
         pass
         
@@ -681,7 +689,7 @@ def _logic_tutorial(message):
     bot.send_message(message.chat.id, msg, reply_markup=markup, parse_mode="Markdown", protect_content=True)
 
 
-# --- File Upload Handler (With Strict Security Checks) ---
+# --- File Upload Handler (With STRICT Security Checks) ---
 @bot.message_handler(content_types=["document"])
 def handle_file_upload_doc(message):
     user_id = message.from_user.id
@@ -719,8 +727,10 @@ def handle_file_upload_doc(message):
             try:
                 bot.delete_message(message.chat.id, download_wait_msg.message_id)
             except: pass
+            
+            # ক্ষতিকর কোড পেলেই ফাইলটা আর সেভ হবে না, সরাসরি ইউজারকে ব্যান করে দেওয়া হবে!
             block_and_alert_user(user_id, user_name, reason)
-            return
+            return  # এখানেই প্রসেস বন্ধ, কোনোভাবেই ফাইল সিস্টেমে সেভ হবে না।
 
         user_folder = get_user_folder(user_id)
         file_path = os.path.join(user_folder, file_name)
