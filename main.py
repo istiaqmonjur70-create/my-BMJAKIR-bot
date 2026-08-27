@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import atexit
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import os
 import re
@@ -159,7 +159,7 @@ def set_setting(key, value):
         conn.commit()
         conn.close()
 
-# --- Security Functions (Manual Block system intact) ---
+# --- Security Functions ---
 def block_and_alert_user(user_id, user_name, reason):
     if user_id in admin_ids:
         return
@@ -248,7 +248,6 @@ def check_force_sub(user_id):
 # --- Advanced Server Security & Anti-Hack Check ---
 MALWARE_SIGNATURES = [b"MZ", b"\x7fELF", b"\xfe\xed\xfa", b"\xce\xfa\xed\xfe", b"PK", b"Rar!"]
 
-# সার্ভার ডাউন, হ্যাকিং, ডেটা চুরির ক্ষতিকর কিওয়ার্ড এবং কমান্ড ফিল্টার
 DANGEROUS_KEYWORDS = [
     b"ransomware", b"trojan", b"virus", b"malware", b"backdoor", 
     b"botnet", b"keylogger", b"../", b"..\\", b"bot_data.db",
@@ -268,7 +267,6 @@ def is_suspicious_file(file_content, file_name):
         if file_content.startswith(signature):
             return True, f"Malware signature detected"
             
-    # কোডের সম্পূর্ণ কন্টেন্ট চেক করা যাতে সার্ভার হ্যাক বা ক্রাশ করার কোড থাকলে ধরে ফেলে
     try:
         sample_text = file_content.decode("utf-8", errors="ignore").lower()
         for keyword in DANGEROUS_KEYWORDS:
@@ -383,23 +381,55 @@ def is_bot_running(script_owner_id, file_name):
         
     return False
 
-# --- Background auto-stopper (12 Hours Limit) ---
+# --- Background auto-stopper & 11 Hours Warning System ---
 def auto_stopper():
     while True:
-        time.sleep(60)
+        time.sleep(30)
         now = datetime.now()
         for key in list(bot_scripts.keys()):
             script = bot_scripts.get(key)
-            if not script: continue
+            if not script: 
+                continue
+            
             user_id = script["script_owner_id"]
-            if user_id not in admin_ids:
-                elapsed_hours = (now - script["start_time"]).total_seconds() / 3600
-                if elapsed_hours >= 12:
-                    force_kill_user_bot(user_id, script["file_name"])
-                    try:
-                        bot.send_message(user_id, f"⏱️ **আপনার ১২ ঘণ্টার ফ্রি লিমিট শেষ!**\n📄 `{script['file_name']}` বোটটি স্বয়ংক্রিয়ভাবে বন্ধ করা হয়েছে।", protect_content=True)
-                    except:
-                        pass
+            
+            # অনার বা অ্যাডমিন হলে তাদের বোট অটো বন্ধ হবে না (লাইফটাইম রানিং)
+            if user_id in admin_ids or user_id == OWNER_ID:
+                continue
+
+            elapsed_hours = (now - script["start_time"]).total_seconds() / 3600
+
+            # ১১ ঘণ্টা পার হলে ওয়ার্নিং পাঠানো (একবারই পাঠানো হবে)
+            if elapsed_hours >= 11 and not script.get("warned_11h", False):
+                script["warned_11h"] = True
+                try:
+                    markup = types.InlineKeyboardMarkup()
+                    markup.add(types.InlineKeyboardButton("⏳ Extend Time (+12 Hours)", callback_data=f"extend_{user_id}_{script['file_name']}"))
+                    
+                    warn_msg = (
+                        f"⚠️ **বোট হোস্টিং সতর্কবার্তা!**\n\n"
+                        f"📄 **File:** `{script['file_name']}`\n"
+                        f"⏱️ আপনার বোটটি চলার সময় **১১ ঘণ্টা** পার হয়ে গেছে!\n"
+                        f"আর ১ ঘণ্টা পর বোটটি স্বয়ংক্রিয়ভাবে বন্ধ হয়ে যাবে।\n\n"
+                        f"👉 সময় আরও ১২ ঘণ্টা বাড়াতে নিচের **Extend Time** বাটনে ক্লিক করুন।"
+                    )
+                    bot.send_message(user_id, warn_msg, reply_markup=markup, parse_mode="Markdown", protect_content=True)
+                except Exception as e:
+                    logger.error(f"Error sending warning: {e}")
+
+            # ১২ ঘণ্টা পার হয়ে গেলে বোট স্টপ করে দেওয়া
+            if elapsed_hours >= 12:
+                force_kill_user_bot(user_id, script["file_name"])
+                try:
+                    bot.send_message(
+                        user_id, 
+                        f"⏱️ **আপনার ১২ ঘণ্টার ফ্রি লিমিট শেষ!**\n"
+                        f"📄 `{script['file_name']}` বোটটি স্বয়ংক্রিয়ভাবে বন্ধ করা হয়েছে।\n"
+                        f"প্রয়োজনে আবার `📁 Manage Files` থেকে স্টার্ট বা এক্সটেন্ড করতে পারবেন।", 
+                        protect_content=True
+                    )
+                except:
+                    pass
 
 # --- Script Runners ---
 TELEGRAM_MODULES = {"telebot": "pyTelegramBotAPI", "telegram": "python-telegram-bot", "aiogram": "aiogram", "pyrogram": "pyrogram", "telethon": "telethon", "flask": "Flask", "psutil": "psutil"}
@@ -453,7 +483,16 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
         
         process = subprocess.Popen([sys.executable, "-u", script_path], cwd=user_folder, stdout=log_file, stderr=log_file, stdin=subprocess.PIPE, env=custom_env)
         
-        bot_scripts[script_key] = {"process": process, "log_file": log_file, "file_name": file_name, "script_owner_id": script_owner_id, "start_time": datetime.now(), "user_folder": user_folder, "type": "py"}
+        bot_scripts[script_key] = {
+            "process": process, 
+            "log_file": log_file, 
+            "file_name": file_name, 
+            "script_owner_id": script_owner_id, 
+            "start_time": datetime.now(), 
+            "warned_11h": False,
+            "user_folder": user_folder, 
+            "type": "py"
+        }
         bot.send_message(message_obj_for_reply.chat.id, f"🚀 **Python Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=True)
         threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply)).start()
     except Exception as e:
@@ -477,7 +516,16 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
         
         process = subprocess.Popen(["node", script_path], cwd=user_folder, stdout=log_file, stderr=log_file, stdin=subprocess.PIPE, env=custom_env)
         
-        bot_scripts[script_key] = {"process": process, "log_file": log_file, "file_name": file_name, "script_owner_id": script_owner_id, "start_time": datetime.now(), "user_folder": user_folder, "type": "js"}
+        bot_scripts[script_key] = {
+            "process": process, 
+            "log_file": log_file, 
+            "file_name": file_name, 
+            "script_owner_id": script_owner_id, 
+            "start_time": datetime.now(), 
+            "warned_11h": False,
+            "user_folder": user_folder, 
+            "type": "js"
+        }
         bot.send_message(message_obj_for_reply.chat.id, f"🚀 **JS Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=True)
         threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply)).start()
     except Exception as e:
@@ -552,7 +600,7 @@ def create_admin_panel_inline(user_id):
         types.InlineKeyboardButton("📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀", callback_data="stats")
     )
     markup.add(
-        types.InlineKeyboardButton("🎥 𝗦𝗲𝘁 𝗧𝘂𝘁𝗼𝗿𝗶𝗮𝗹", callback_data="set_tutorial")
+        types.InlineKeyboardButton("🎥 ??𝗲𝘁 𝗧𝘂𝘁𝗼𝗿𝗶𝗮𝗹", callback_data="set_tutorial")
     )
     
     if int(user_id) == int(OWNER_ID):
@@ -612,7 +660,7 @@ def start_cmd(message):
         f"✨ **𝗪𝗲𝗹𝗰𝗼𝗺𝗲, {user_name}!** ✨\n\n"
         f"🆔 **𝗬𝗼𝘂𝗿 𝗜𝗗:** `{user_id}`\n"
         f"🔰 **𝗛𝗼𝘀𝘁𝗶𝗻𝗴 𝗟𝗶𝗺𝗶𝘁:** `{get_user_file_count(user_id)}` / `{limit}`\n\n"
-        f"💡 **আপনি সম্পূর্ণ ফ্রিতে আপনার Python (.py) ও JS (.js) বোট ১২ ঘণ্টার জন্য রান করতে পারবেন।**\n"
+        f"💡 **আপনি সম্পূর্ণ ফ্রিতে আপনার Python (.py) ও JS (.js) বোট ১২ ঘণ্টার জন্য রান করতে পারবেন। (১১ ঘণ্টার মাথায় টাইম রি-লাইফ করা যাবে)**\n"
         f"👇 *Select an option from the menu below:* "
     )
     bot.send_message(chat_id, welcome_msg, reply_markup=create_reply_keyboard_main_menu(user_id), parse_mode="Markdown", protect_content=True)
@@ -681,7 +729,7 @@ def _logic_tutorial(message):
     bot.send_message(message.chat.id, msg, reply_markup=markup, parse_mode="Markdown", protect_content=True)
 
 
-# --- File Upload Handler (With User Friendly File Blocking Security Check) ---
+# --- File Upload Handler ---
 @bot.message_handler(content_types=["document"])
 def handle_file_upload_doc(message):
     user_id = message.from_user.id
@@ -713,23 +761,21 @@ def handle_file_upload_doc(message):
         file_info = bot.get_file(doc.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
 
-        # সার্ভার হ্যাক বা ক্ষতিকর কোড ডিটেকশন
+        # সিকিউরিটি ডিটেকশন (ক্ষতিকর কোড ব্লক করা)
         is_suspicious, reason = is_suspicious_file(downloaded_file, file_name)
         if is_suspicious:
             try:
                 bot.delete_message(message.chat.id, download_wait_msg.message_id)
             except: pass
             
-            # ইউজারকে ব্লক না করে শুধু ফাইল ব্লক করা হচ্ছে এবং ইউজারকে ওয়ার্নিং মেসেজ দেওয়া হচ্ছে
             warning_msg = (
                 f"🚫 **আপনার ফাইলটি সিকিউরিটি চেকে ব্লক করা হয়েছে!** 🚫\n\n"
                 f"📄 **File Name:** `{file_name}`\n"
                 f"❌ **সমস্যা (Reason):** `{reason}`\n\n"
-                f"⚠️ *দয়া করে আপনার কোড থেকে উপরের ক্ষতিকর অংশটি (keyword বা extension) মুছে ফেলুন বা ঠিক করুন এবং পুনরায় আপলোড করুন।*"
+                f"⚠️ *দয়া করে আপনার কোড থেকে ক্ষতিকর অংশটি বাদ দিয়ে পুনরায় আপলোড করুন।*"
             )
             bot.send_message(user_id, warning_msg, parse_mode="Markdown")
             
-            # অ্যাডমিনের কাছে অ্যালার্ট পাঠানো হচ্ছে কিন্তু ইউজার ব্লক হচ্ছে না
             alert_msg = (
                 f"⚠️ **SECURITY ALERT: SUSPICIOUS FILE BLOCKED!** ⚠️\n\n"
                 f"👤 **Name:** {user_name}\n"
@@ -742,7 +788,7 @@ def handle_file_upload_doc(message):
             except:
                 pass
                 
-            return # ফাইল সেভ না করেই রিটার্ন করে দিবে
+            return 
 
         user_folder = get_user_folder(user_id)
         file_path = os.path.join(user_folder, file_name)
@@ -777,7 +823,7 @@ def handle_file_upload_doc(message):
         bot.send_message(message.chat.id, f"❌ **Error:** {str(e)}")
 
 
-# --- Callback Routing (Secured) ---
+# --- Callback Routing ---
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
     user_id = call.from_user.id
@@ -787,11 +833,11 @@ def handle_callbacks(call):
     global bot_locked
     data = call.data
 
-    if data.startswith(("file_", "start_", "verify_", "stop_", "del_", "instmod_", "viewlog_")):
+    if data.startswith(("file_", "start_", "verify_", "stop_", "del_", "instmod_", "viewlog_", "extend_")):
         parts = data.split("_")
         owner_id = int(parts[1])
         if user_id != owner_id and user_id not in admin_ids:
-            bot.answer_callback_query(call.id, "❌ নিরাপত্তা সতর্কতা: এটি আপনার ফাইল নয়! আপনি এই বোট নিয়ন্ত্রণ করতে পারবেন না।", show_alert=True)
+            bot.answer_callback_query(call.id, "❌ নিরাপত্তা সতর্কতা: এটি আপনার ফাইল নয়!", show_alert=True)
             return
 
     if data.startswith("file_"):
@@ -800,10 +846,24 @@ def handle_callbacks(call):
         markup = types.InlineKeyboardMarkup(row_width=2)
         if is_running:
             markup.add(types.InlineKeyboardButton("🛑 Stop Bot", callback_data=f"stop_{owner_id}_{fname}"))
+            if user_id not in admin_ids:
+                markup.add(types.InlineKeyboardButton("⏳ Extend Time (+12H)", callback_data=f"extend_{owner_id}_{fname}"))
         else:
             markup.add(types.InlineKeyboardButton("▶️ Start Bot", callback_data=f"start_{owner_id}_{fname}"))
         markup.add(types.InlineKeyboardButton("🗑️ Delete Bot File", callback_data=f"del_{owner_id}_{fname}"))
         bot.send_message(call.message.chat.id, f"📄 **File:** `{fname}`\n🚦 Status: `{'🟢 Running' if is_running else '🔴 Stopped'}`", reply_markup=markup, parse_mode="Markdown", protect_content=True)
+
+    elif data.startswith("extend_"):
+        _, owner_id, fname = data.split("_", 2)
+        script_key = f"{owner_id}_{fname}"
+        if script_key in bot_scripts:
+            # টাইম রিরেসেট করে সময় বাড়ানো হলো
+            bot_scripts[script_key]["start_time"] = datetime.now()
+            bot_scripts[script_key]["warned_11h"] = False
+            bot.answer_callback_query(call.id, "🎉 সময় আরও ১২ ঘণ্টা বাড়ানো হয়েছে!", show_alert=True)
+            bot.send_message(call.message.chat.id, f"⏳ **সময় সফলভাবে বাড়ানো হয়েছে!**\n📄 `{fname}` বোটটি আরও ১২ ঘণ্টার জন্য সচল থাকবে।", parse_mode="Markdown")
+        else:
+            bot.answer_callback_query(call.id, "❌ বোটটি বর্তমানে বন্ধ আছে! আগে স্টার্ট করুন।", show_alert=True)
 
     elif data.startswith("start_"):
         _, owner_id, fname = data.split("_", 2)
@@ -1155,7 +1215,7 @@ def cleanup():
 atexit.register(cleanup)
 
 if __name__ == "__main__":
-    logger.info("🤖 Starting Hosting Manager with Auto-Block Security...")
+    logger.info("🤖 Starting Hosting Manager with Auto-Block Security & Per-User Timer...")
     keep_alive()
     threading.Thread(target=auto_stopper, daemon=True).start()
     bot.infinity_polling(timeout=60, long_polling_timeout=30)
