@@ -35,7 +35,6 @@ def keep_alive():
     print("Flask Keep-Alive server started.")
 
 # --- Configuration ---
-# ⚠️ বটফাদার থেকে নতুন টোকেন জেনারেট করে নিচে বসান
 TOKEN = "8627005003:AAG1-Q90g4z5SME-WOeYvfrfQmmuMR7h3k0"
 OWNER_ID = 8814363793
 ADMIN_ID = 8814363793
@@ -160,7 +159,7 @@ def set_setting(key, value):
         conn.commit()
         conn.close()
 
-# --- Security Functions ---
+# --- Security Functions (Manual Block system intact) ---
 def block_and_alert_user(user_id, user_name, reason):
     if user_id in admin_ids:
         return
@@ -178,11 +177,11 @@ def block_and_alert_user(user_id, user_name, reason):
         f"👤 **Name:** {user_name}\n"
         f"🆔 **User ID:** `{user_id}`\n"
         f"❌ **Reason:** `{reason}`\n\n"
-        f"⚠️ *এই ইউজারকে সার্ভারে ক্ষতিকর বা হ্যাকিং স্ক্রিপ্ট চালানোর চেষ্টার কারণে বোট থেকে স্থায়ীভাবে ব্লক করা হয়েছে!*"
+        f"⚠️ *এই ইউজারকে সার্ভার হ্যাক বা ডাউন করার চেষ্টার কারণে বট থেকে স্থায়ীভাবে ব্লক করা হয়েছে!*"
     )
     try:
         bot.send_message(OWNER_ID, alert_msg, parse_mode="Markdown")
-        bot.send_message(user_id, "🚫 **আপনাকে ক্ষতিকর কোড আপলোড করার কারণে স্থায়ীভাবে ব্লক করা হয়েছে!**", protect_content=True)
+        bot.send_message(user_id, "🚫 **আপনাকে সার্ভার হ্যাক বা ক্ষতিকর কোড আপলোড করার কারণে স্থায়ীভাবে ব্লক করা হয়েছে!**", protect_content=True)
     except:
         pass
 
@@ -246,13 +245,17 @@ def check_force_sub(user_id):
             
     return not_joined
 
-# --- Server Security Check ---
-# শুধুমাত্র এক্সিকিউটেবল/বাইনারি ও সরাসরি সিস্টেম ক্ষতিকর প্যাটার্ন ধরা হয় (সাধারণ বোট রান হতে বাধা দেয় না)
+# --- Advanced Server Security & Anti-Hack Check ---
 MALWARE_SIGNATURES = [b"MZ", b"\x7fELF", b"\xfe\xed\xfa", b"\xce\xfa\xed\xfe", b"PK", b"Rar!"]
 
+# সার্ভার ডাউন, হ্যাকিং, ডেটা চুরির ক্ষতিকর কিওয়ার্ড এবং কমান্ড ফিল্টার
 DANGEROUS_KEYWORDS = [
-    b"../", b"..\\", b"bot_data.db",
-    b"shutil.rmtree('/')", b"os.system('rm -rf", b"os.system(\"rm -rf"
+    b"ransomware", b"trojan", b"virus", b"malware", b"backdoor", 
+    b"botnet", b"keylogger", b"../", b"..\\", b"bot_data.db",
+    b"os.system", b"subprocess.call", b"subprocess.Popen", b"shutil.rmtree",
+    b"socket.socket", b"urllib.request", b"requests.get", b"requests.post",
+    b"eval(", b"exec(", b"__import__", b"pickle.loads", b"ctypes",
+    b"fork()", b"while True:", b"while(1):", b"child_process", b"require('child_process')"
 ]
 
 def is_suspicious_file(file_content, file_name):
@@ -263,14 +266,15 @@ def is_suspicious_file(file_content, file_name):
         
     for signature in MALWARE_SIGNATURES:
         if file_content.startswith(signature):
-            return True, f"Malware/Binary signature detected"
+            return True, f"Malware signature detected"
             
+    # কোডের সম্পূর্ণ কন্টেন্ট চেক করা যাতে সার্ভার হ্যাক বা ক্রাশ করার কোড থাকলে ধরে ফেলে
     try:
         sample_text = file_content.decode("utf-8", errors="ignore").lower()
         for keyword in DANGEROUS_KEYWORDS:
             if keyword.decode('utf-8') in sample_text:
-                return True, f"Security Violation: Critical code detected -> {keyword.decode('utf-8')}"
-    except Exception:
+                return True, f"Security Violation: Dangerous code/keyword detected -> {keyword.decode('utf-8')}"
+    except Exception as e:
         pass
         
     return False, "Safe"
@@ -677,7 +681,7 @@ def _logic_tutorial(message):
     bot.send_message(message.chat.id, msg, reply_markup=markup, parse_mode="Markdown", protect_content=True)
 
 
-# --- File Upload Handler ---
+# --- File Upload Handler (With User Friendly File Blocking Security Check) ---
 @bot.message_handler(content_types=["document"])
 def handle_file_upload_doc(message):
     user_id = message.from_user.id
@@ -709,14 +713,36 @@ def handle_file_upload_doc(message):
         file_info = bot.get_file(doc.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
 
-        # নিরাপত্তা ও ক্ষতিকর ফাইল ফিল্টারিং
+        # সার্ভার হ্যাক বা ক্ষতিকর কোড ডিটেকশন
         is_suspicious, reason = is_suspicious_file(downloaded_file, file_name)
         if is_suspicious:
             try:
                 bot.delete_message(message.chat.id, download_wait_msg.message_id)
             except: pass
-            block_and_alert_user(user_id, user_name, reason)
-            return
+            
+            # ইউজারকে ব্লক না করে শুধু ফাইল ব্লক করা হচ্ছে এবং ইউজারকে ওয়ার্নিং মেসেজ দেওয়া হচ্ছে
+            warning_msg = (
+                f"🚫 **আপনার ফাইলটি সিকিউরিটি চেকে ব্লক করা হয়েছে!** 🚫\n\n"
+                f"📄 **File Name:** `{file_name}`\n"
+                f"❌ **সমস্যা (Reason):** `{reason}`\n\n"
+                f"⚠️ *দয়া করে আপনার কোড থেকে উপরের ক্ষতিকর অংশটি (keyword বা extension) মুছে ফেলুন বা ঠিক করুন এবং পুনরায় আপলোড করুন।*"
+            )
+            bot.send_message(user_id, warning_msg, parse_mode="Markdown")
+            
+            # অ্যাডমিনের কাছে অ্যালার্ট পাঠানো হচ্ছে কিন্তু ইউজার ব্লক হচ্ছে না
+            alert_msg = (
+                f"⚠️ **SECURITY ALERT: SUSPICIOUS FILE BLOCKED!** ⚠️\n\n"
+                f"👤 **Name:** {user_name}\n"
+                f"🆔 **User ID:** `{user_id}`\n"
+                f"📄 **File:** `{file_name}`\n"
+                f"❌ **Reason:** `{reason}`"
+            )
+            try:
+                bot.send_message(OWNER_ID, alert_msg, parse_mode="Markdown")
+            except:
+                pass
+                
+            return # ফাইল সেভ না করেই রিটার্ন করে দিবে
 
         user_folder = get_user_folder(user_id)
         file_path = os.path.join(user_folder, file_name)
@@ -751,7 +777,7 @@ def handle_file_upload_doc(message):
         bot.send_message(message.chat.id, f"❌ **Error:** {str(e)}")
 
 
-# --- Callback Routing ---
+# --- Callback Routing (Secured) ---
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
     user_id = call.from_user.id
@@ -1129,7 +1155,7 @@ def cleanup():
 atexit.register(cleanup)
 
 if __name__ == "__main__":
-    logger.info("🤖 Starting Hosting Manager with Security Enhancements...")
+    logger.info("🤖 Starting Hosting Manager with Auto-Block Security...")
     keep_alive()
     threading.Thread(target=auto_stopper, daemon=True).start()
     bot.infinity_polling(timeout=60, long_polling_timeout=30)
