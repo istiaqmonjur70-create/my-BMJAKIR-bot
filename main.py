@@ -22,7 +22,7 @@ app = Flask("")
 
 @app.route("/")
 def home():
-    return "I'm Mukesh File Host"
+    return "I'm Mukesh File Host - Secure Mode"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -35,7 +35,7 @@ def keep_alive():
     print("Flask Keep-Alive server started.")
 
 # --- Configuration ---
-TOKEN = "8627005003:AAG1-Q90g4z5SME-WOeYvfrfQmmuMR7h3k0"
+TOKEN = "8910223271:AAEGc6ZTC4qE6FkOBLL13Xj0QwtQyfCI7CU"
 OWNER_ID = 8814363793
 ADMIN_ID = 8814363793
 YOUR_USERNAME = "@Bmjakir69"
@@ -60,7 +60,7 @@ bot_scripts = {}
 user_files = {}
 active_users = set()
 admin_ids = {ADMIN_ID, OWNER_ID}
-blocked_users = set() # ব্লকড ইউজার লিস্ট
+blocked_users = set()
 bot_locked = False
 
 # --- Logging Setup ---
@@ -92,7 +92,7 @@ def init_db():
     try:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS user_files (user_id INTEGER, file_name TEXT, file_type TEXT, PRIMARY KEY (user_id, file_name))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS user_files (user_id INTEGER, file_name TEXT, file_type TEXT, status TEXT DEFAULT 'pending', PRIMARY KEY (user_id, file_name))""")
         c.execute("""CREATE TABLE IF NOT EXISTS active_users (user_id INTEGER PRIMARY KEY)""")
         c.execute("""CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)""")
         c.execute("""CREATE TABLE IF NOT EXISTS force_channels (channel_id TEXT PRIMARY KEY, channel_url TEXT)""")
@@ -117,11 +117,11 @@ def load_data():
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
 
-        c.execute("SELECT user_id, file_name, file_type FROM user_files")
-        for user_id, file_name, file_type in c.fetchall():
+        c.execute("SELECT user_id, file_name, file_type, status FROM user_files")
+        for user_id, file_name, file_type, status in c.fetchall():
             if user_id not in user_files:
                 user_files[user_id] = []
-            user_files[user_id].append((file_name, file_type))
+            user_files[user_id].append((file_name, file_type, status))
 
         c.execute("SELECT user_id FROM active_users")
         active_users.update(user_id for (user_id,) in c.fetchall())
@@ -159,7 +159,7 @@ def set_setting(key, value):
         conn.commit()
         conn.close()
 
-# --- Security Functions ---
+# --- Security & Anti-Hack Functions ---
 def block_and_alert_user(user_id, user_name, reason):
     if user_id in admin_ids:
         return
@@ -173,88 +173,29 @@ def block_and_alert_user(user_id, user_name, reason):
         conn.close()
         
     alert_msg = (
-        f"🚨 **SECURITY ALERT: USER BLOCKED!** 🚨\n\n"
+        f"🚨 **SECURITY ALERT: HACK ATTEMPT BLOCKED!** 🚨\n\n"
         f"👤 **Name:** {user_name}\n"
         f"🆔 **User ID:** `{user_id}`\n"
         f"❌ **Reason:** `{reason}`\n\n"
-        f"⚠️ *এই ইউজারকে সার্ভার হ্যাক বা ডাউন করার চেষ্টার কারণে বট থেকে স্থায়ীভাবে ব্লক করা হয়েছে!*"
+        f"⚠️ *এই ইউজার সার্ভার কন্ট্রোল বা হ্যাক করার চেষ্টা করায় তাকে স্থায়ীভাবে ব্লক করা হয়েছে!*"
     )
     try:
         bot.send_message(OWNER_ID, alert_msg, parse_mode="Markdown")
-        bot.send_message(user_id, "🚫 **আপনাকে সার্ভার হ্যাক বা ক্ষতিকর কোড আপলোড করার কারণে স্থায়ীভাবে ব্লক করা হয়েছে!**", protect_content=True)
+        bot.send_message(user_id, "🚫 **আপনাকে সার্ভার হ্যাক বা ক্ষতিকর স্ক্রিপ্ট আপলোড করার কারণে স্থায়ীভাবে ব্লক করা হয়েছে!**", protect_content=True)
     except:
         pass
 
-# --- Limits & Referral Helper ---
-def get_referral_count(user_id):
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM referrals WHERE user_id=?", (user_id,))
-    count = c.fetchone()[0]
-    conn.close()
-    return count
-
-def get_user_file_limit(user_id):
-    if user_id == OWNER_ID or user_id in admin_ids:
-        return float("inf")
-    
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute("SELECT max_limit FROM custom_limits WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    
-    if row is not None:
-        return row[0]
-        
-    ref_count = get_referral_count(user_id)
-    bonus = min(2, ref_count)
-    return 1 + bonus
-
-def get_user_file_count(user_id):
-    return len(user_files.get(user_id, []))
-
-# --- Force Sub Check ---
-def get_force_channels():
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute("SELECT channel_id, channel_url FROM force_channels")
-    channels = c.fetchall()
-    conn.close()
-    return channels
-
-def check_force_sub(user_id):
-    if user_id in admin_ids:
-        return []
-        
-    channels = get_force_channels()
-    not_joined = []
-    
-    for ch_id, ch_url in channels:
-        try:
-            chat_target = ch_id.strip()
-            if chat_target.lstrip('-').isdigit():
-                chat_target = int(chat_target)
-            
-            member = bot.get_chat_member(chat_target, user_id)
-            if member.status in ['left', 'kicked', 'restricted']:
-                not_joined.append((ch_id, ch_url))
-        except Exception as e:
-            logger.warning(f"Force Sub error for {user_id} in {ch_id}: {e}")
-            pass
-            
-    return not_joined
-
-# --- Advanced Server Security & Anti-Hack Check ---
 MALWARE_SIGNATURES = [b"MZ", b"\x7fELF", b"\xfe\xed\xfa", b"\xce\xfa\xed\xfe", b"PK", b"Rar!"]
 
 DANGEROUS_KEYWORDS = [
     b"ransomware", b"trojan", b"virus", b"malware", b"backdoor", 
     b"botnet", b"keylogger", b"../", b"..\\", b"bot_data.db",
-    b"os.system", b"subprocess.call", b"subprocess.Popen", b"shutil.rmtree",
-    b"socket.socket", b"urllib.request", b"requests.get", b"requests.post",
-    b"eval(", b"exec(", b"__import__", b"pickle.loads", b"ctypes",
-    b"fork()", b"while True:", b"while(1):", b"child_process", b"require('child_process')"
+    b"os.system", b"subprocess.", b"shutil.rmtree", b"socket.", 
+    b"urllib.", b"requests.", b"eval(", b"exec(", b"__import__", 
+    b"pickle.", b"ctypes", b"fork()", b"while True:", b"while(1):", 
+    b"child_process", b"require('child_process')", b"execSync", b"spawn(",
+    b"127.0.0.1", b"localhost", b"http://", b"https://", b"sys.exit",
+    b"sqlite3", b"psutil", b"open('/etc", b"open('C:\\"
 ]
 
 def is_suspicious_file(file_content, file_name):
@@ -271,7 +212,7 @@ def is_suspicious_file(file_content, file_name):
         sample_text = file_content.decode("utf-8", errors="ignore").lower()
         for keyword in DANGEROUS_KEYWORDS:
             if keyword.decode('utf-8') in sample_text:
-                return True, f"Security Violation: Dangerous code/keyword detected -> {keyword.decode('utf-8')}"
+                return True, f"Anti-Hack Violation: Dangerous code/keyword detected -> {keyword.decode('utf-8')}"
     except Exception as e:
         pass
         
@@ -381,7 +322,7 @@ def is_bot_running(script_owner_id, file_name):
         
     return False
 
-# --- Background auto-stopper & 11 Hours Warning System ---
+# --- Auto-Stopper & 11 Hours Warning System ---
 def auto_stopper():
     while True:
         time.sleep(30)
@@ -392,14 +333,11 @@ def auto_stopper():
                 continue
             
             user_id = script["script_owner_id"]
-            
-            # অনার বা অ্যাডমিন হলে তাদের বোট অটো বন্ধ হবে না (লাইফটাইম রানিং)
             if user_id in admin_ids or user_id == OWNER_ID:
                 continue
 
             elapsed_hours = (now - script["start_time"]).total_seconds() / 3600
 
-            # ১১ ঘণ্টা পার হলে ওয়ার্নিং পাঠানো (একবারই পাঠানো হবে)
             if elapsed_hours >= 11 and not script.get("warned_11h", False):
                 script["warned_11h"] = True
                 try:
@@ -417,63 +355,26 @@ def auto_stopper():
                 except Exception as e:
                     logger.error(f"Error sending warning: {e}")
 
-            # ১২ ঘণ্টা পার হয়ে গেলে বোট স্টপ করে দেওয়া
             if elapsed_hours >= 12:
                 force_kill_user_bot(user_id, script["file_name"])
                 try:
                     bot.send_message(
                         user_id, 
                         f"⏱️ **আপনার ১২ ঘণ্টার ফ্রি লিমিট শেষ!**\n"
-                        f"📄 `{script['file_name']}` বোটটি স্বয়ংক্রিয়ভাবে বন্ধ করা হয়েছে।\n"
-                        f"প্রয়োজনে আবার `📁 Manage Files` থেকে স্টার্ট বা এক্সটেন্ড করতে পারবেন।", 
+                        f"📄 `{script['file_name']}` বোটটি স্বয়ংক্রিয়ভাবে বন্ধ করা হয়েছে।", 
                         protect_content=True
                     )
                 except:
                     pass
 
 # --- Script Runners ---
-TELEGRAM_MODULES = {"telebot": "pyTelegramBotAPI", "telegram": "python-telegram-bot", "aiogram": "aiogram", "pyrogram": "pyrogram", "telethon": "telethon", "flask": "Flask", "psutil": "psutil"}
-
-def monitor_and_guide_error(process, log_file_path, script_owner_id, file_name, message_obj_for_reply):
-    time.sleep(3)
-    if process.poll() is not None:
-        try:
-            with open(log_file_path, "r", encoding="utf-8", errors="ignore") as f:
-                log_content = f.read()
-
-            match_py = re.search(r"(?:ModuleNotFoundError|ImportError): No module named '(.+?)'", log_content)
-            match_js = re.search(r"Cannot find module '(.+?)'", log_content)
-
-            missing_module = None
-            if match_py: missing_module = match_py.group(1).split(".")[0].strip("'\"")
-            elif match_js: missing_module = match_js.group(1).split("/")[0].strip("'\"")
-
-            if missing_module:
-                pkg_name = TELEGRAM_MODULES.get(missing_module.lower(), missing_module)
-                ext = os.path.splitext(file_name)[1].lower()
-                cmd_text = f"npm install {pkg_name}" if ext == ".js" else f"pip install {pkg_name}"
-                error_msg = f"⚠️ **ফাইল রান হতে সমস্যা হয়েছে!**\n\n📄 **File:** `{file_name}`\n❌ **সমস্যা:** আপনার কোডে `{missing_module}` মডিউলটি মিসিং আছে।\n💻 **প্রয়োজনীয় কমান্ড:** `{cmd_text}`"
-                
-                markup = types.InlineKeyboardMarkup()
-                markup.add(types.InlineKeyboardButton(f"📦 Install {pkg_name}", callback_data=f"instmod_{script_owner_id}_{missing_module}_{file_name}"))
-                markup.add(types.InlineKeyboardButton("📄 View Error Logs", callback_data=f"viewlog_{script_owner_id}_{file_name}"))
-                bot.send_message(message_obj_for_reply.chat.id, error_msg, reply_markup=markup, parse_mode="Markdown", protect_content=True)
-            else:
-                markup = types.InlineKeyboardMarkup()
-                markup.add(types.InlineKeyboardButton("📄 View Error Logs", callback_data=f"viewlog_{script_owner_id}_{file_name}"))
-                bot.send_message(message_obj_for_reply.chat.id, f"⚠️ **আপনার কোডে ভুল (Syntax/Runtime Error) পাওয়া গেছে!**\n📄 **File:** `{file_name}`", reply_markup=markup, parse_mode="Markdown", protect_content=True)
-        except: pass
-
 def run_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply):
     script_key = f"{script_owner_id}_{file_name}"
     try:
         log_file_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
         log_file = open(log_file_path, "w", encoding="utf-8", errors="ignore")
         
-        unique_port = 8000 + (int(hashlib.md5(script_key.encode()).hexdigest(), 16) % 50000)
-        
         custom_env = os.environ.copy()
-        custom_env["PORT"] = str(unique_port)
         custom_env["PYTHONDONTWRITEBYTECODE"] = "1"
         custom_env["PYTHONPATH"] = user_folder
         custom_env["HOME"] = user_folder        
@@ -493,8 +394,7 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
             "user_folder": user_folder, 
             "type": "py"
         }
-        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **Python Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=True)
-        threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply)).start()
+        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **Python Bot Started Securely!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=True)
     except Exception as e:
         bot.send_message(message_obj_for_reply.chat.id, f"❌ Error: {str(e)}", protect_content=True)
 
@@ -504,10 +404,7 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
         log_file_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
         log_file = open(log_file_path, "w", encoding="utf-8", errors="ignore")
         
-        unique_port = 8000 + (int(hashlib.md5(script_key.encode()).hexdigest(), 16) % 50000)
-        
         custom_env = os.environ.copy()
-        custom_env["PORT"] = str(unique_port)
         custom_env["NODE_PATH"] = user_folder
         custom_env["HOME"] = user_folder
         custom_env["TEMP"] = user_folder
@@ -526,8 +423,7 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
             "user_folder": user_folder, 
             "type": "js"
         }
-        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **JS Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=True)
-        threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply)).start()
+        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **JS Bot Started Securely!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=True)
     except Exception as e:
         bot.send_message(message_obj_for_reply.chat.id, f"❌ Error: {str(e)}", protect_content=True)
 
@@ -547,16 +443,24 @@ def do_start_bot(owner_id, fname, message_obj, call_id=None):
         run_script(fpath, int(owner_id), ufolder, fname, message_obj)
 
 # --- DB Files Operations ---
-def save_user_file(user_id, file_name, file_type="py"):
+def save_user_file(user_id, file_name, file_type="py", status="pending"):
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO user_files (user_id, file_name, file_type) VALUES (?, ?, ?)", (user_id, file_name, file_type))
+        c.execute("INSERT OR REPLACE INTO user_files (user_id, file_name, file_type, status) VALUES (?, ?, ?, ?)", (user_id, file_name, file_type, status))
         conn.commit()
         conn.close()
         if user_id not in user_files: user_files[user_id] = []
-        user_files[user_id] = [(fn, ft) for fn, ft in user_files[user_id] if fn != file_name]
-        user_files[user_id].append((file_name, file_type))
+        user_files[user_id] = [(fn, ft, st) for fn, ft, st in user_files[user_id] if fn != file_name]
+        user_files[user_id].append((file_name, file_type, status))
+
+def get_file_status(user_id, file_name):
+    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    c = conn.cursor()
+    c.execute("SELECT status FROM user_files WHERE user_id=? AND file_name=?", (user_id, file_name))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else "pending"
 
 def remove_user_file_db(user_id, file_name):
     with DB_LOCK:
@@ -600,7 +504,7 @@ def create_admin_panel_inline(user_id):
         types.InlineKeyboardButton("📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀", callback_data="stats")
     )
     markup.add(
-        types.InlineKeyboardButton("🎥 ??𝗲𝘁 𝗧𝘂𝘁𝗼𝗿𝗶𝗮𝗹", callback_data="set_tutorial")
+        types.InlineKeyboardButton("🎥 𝗦𝗲𝘁 𝗧𝘂𝘁𝗼𝗿𝗶𝗮𝗹", callback_data="set_tutorial")
     )
     
     if int(user_id) == int(OWNER_ID):
@@ -654,13 +558,39 @@ def start_cmd(message):
         return
 
     add_active_user(user_id)
+    
+    # Get user file count safely
+    files_list = user_files.get(user_id, [])
+    current_count = len(files_list)
+    
+    # Limit helper functions
+    def get_referral_count(uid):
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM referrals WHERE user_id=?", (uid,))
+        cnt = c.fetchone()[0]
+        conn.close()
+        return cnt
+
+    def get_user_file_limit(uid):
+        if uid in admin_ids:
+            return float("inf")
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT max_limit FROM custom_limits WHERE user_id=?", (uid,))
+        row = c.fetchone()
+        conn.close()
+        if row is not None:
+            return row[0]
+        return 1 + min(2, get_referral_count(uid))
+
     limit = get_user_file_limit(user_id)
 
     welcome_msg = (
-        f"✨ **𝗪𝗲𝗹𝗰𝗼𝗺𝗲, {user_name}!** ✨\n\n"
+        f"🔐 **Secure Hosting Bot - Welcome, {user_name}!** ✨\n\n"
         f"🆔 **𝗬𝗼𝘂𝗿 𝗜𝗗:** `{user_id}`\n"
-        f"🔰 **𝗛𝗼𝘀𝘁𝗶𝗻𝗴 𝗟𝗶𝗺𝗶𝘁:** `{get_user_file_count(user_id)}` / `{limit}`\n\n"
-        f"💡 **আপনি সম্পূর্ণ ফ্রিতে আপনার Python (.py) ও JS (.js) বোট ১২ ঘণ্টার জন্য রান করতে পারবেন। (১১ ঘণ্টার মাথায় টাইম রি-লাইফ করা যাবে)**\n"
+        f"🔰 **𝗛𝗼𝘀𝘁𝗶𝗻𝗴 𝗟𝗶𝗺𝗶𝘁:** `{current_count}` / `{limit}`\n\n"
+        f"🛡️ *প্রতিটি আপলোড করা ফাইল অ্যাডমিন অ্যাপ্রুভালের পর রান হবে।*\n"
         f"👇 *Select an option from the menu below:* "
     )
     bot.send_message(chat_id, welcome_msg, reply_markup=create_reply_keyboard_main_menu(user_id), parse_mode="Markdown", protect_content=True)
@@ -672,16 +602,35 @@ def _logic_upload_file(message):
         bot.send_message(message.chat.id, "⚠️ **Bot is locked by Admin.**")
         return
 
-    current_count = get_user_file_count(user_id)
+    def get_referral_count(uid):
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM referrals WHERE user_id=?", (uid,))
+        cnt = c.fetchone()[0]
+        conn.close()
+        return cnt
+
+    def get_user_file_limit(uid):
+        if uid in admin_ids:
+            return float("inf")
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT max_limit FROM custom_limits WHERE user_id=?", (uid,))
+        row = c.fetchone()
+        conn.close()
+        if row is not None:
+            return row[0]
+        return 1 + min(2, get_referral_count(uid))
+
+    current_count = len(user_files.get(user_id, []))
     max_limit = get_user_file_limit(user_id)
 
     if current_count >= max_limit:
-        bot.send_message(message.chat.id, f"⚠️ **আপনার আপলোড লিমিট শেষ!**\n\n📊 **বর্তমান আপলোড:** `{current_count}` / `{max_limit}`\n"
-                              f"নতুন কোনো ফাইল রান করাতে `📁 Manage Files` থেকে যেকোনো একটি বোট ডিলিট করুন অথবা রেফার করুন।", parse_mode="Markdown")
+        bot.send_message(message.chat.id, f"⚠️ **আপনার আপলোড লিমিট শেষ!**\n\n📊 **বর্তমান আপলোড:** `{current_count}` / `{max_limit}`", parse_mode="Markdown")
         return
 
     bot.send_message(message.chat.id, "🚀 **আপনার Python (.py) অথবা JS (.js) বোট ফাইলটি মেসেজে আপলোড করুন।**\n"
-                          "*(ফাইল দেওয়ার পর ফাইলটি চেক ও সেভ হবে। এরপর Manage Files থেকে বোটটি চালু করতে হবে)*", parse_mode="Markdown")
+                          "*(ফাইলটি আপলোড করার সাথে সাথে সিকিউরিটি স্ক্যান হবে এবং অ্যাডমিনের কাছে অ্যাপ্রুভালের জন্য চলে যাবে)*", parse_mode="Markdown")
 
 
 def _logic_check_files(message):
@@ -691,11 +640,40 @@ def _logic_check_files(message):
         bot.send_message(message.chat.id, "📂 **Your Uploaded Files:**\n\n*(No files uploaded yet)*", parse_mode="Markdown")
         return
     markup = types.InlineKeyboardMarkup(row_width=1)
-    for file_name, file_type in sorted(user_files_list):
-        is_running = is_bot_running(user_id, file_name)
-        status_icon = "🟢 Running" if is_running else "🔴 Stopped"
-        btn_text = f"📄 {file_name} ({file_type}) - {status_icon}"
+    for file_info in sorted(user_files_list):
+        file_name = file_info[0]
+        file_type = file_info[1]
+        status = file_info[2] if len(file_info) > 2 else "approved"
+        
+        if status == "pending":
+            status_text = "⏳ Pending Admin Approval"
+        else:
+            is_running = is_bot_running(user_id, file_name)
+            status_text = "🟢 Running" if is_running else "🔴 Stopped"
+            
+        btn_text = f"📄 {file_name} ({file_type}) - {status_text}"
         markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"file_{user_id}_{file_name}"))
+        
+    def get_referral_count(uid):
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM referrals WHERE user_id=?", (uid,))
+        cnt = c.fetchone()[0]
+        conn.close()
+        return cnt
+
+    def get_user_file_limit(uid):
+        if uid in admin_ids:
+            return float("inf")
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT max_limit FROM custom_limits WHERE user_id=?", (uid,))
+        row = c.fetchone()
+        conn.close()
+        if row is not None:
+            return row[0]
+        return 1 + min(2, get_referral_count(uid))
+
     bot.send_message(message.chat.id, f"📁 **𝗠𝗮𝗻𝗮𝗴𝗲 𝗬𝗼𝘂𝗿 𝗙𝗶𝗹𝗲𝘀 ({len(user_files_list)}/{get_user_file_limit(user_id)}):**", reply_markup=markup, parse_mode="Markdown", protect_content=True)
 
 
@@ -703,13 +681,29 @@ def _logic_referral(message):
     user_id = message.from_user.id
     bot_info = bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
-    ref_count = get_referral_count(user_id)
+    
+    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM referrals WHERE user_id=?", (user_id,))
+    ref_count = c.fetchone()[0]
+    conn.close()
+
+    def get_user_file_limit(uid):
+        if uid in admin_ids:
+            return float("inf")
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT max_limit FROM custom_limits WHERE user_id=?", (uid,))
+        row = c.fetchone()
+        conn.close()
+        if row is not None:
+            return row[0]
+        return 1 + min(2, ref_count)
+
     limit = get_user_file_limit(user_id)
     
     msg = (
         f"🎁 **𝗥𝗲𝗳𝗲𝗿 𝗔𝗻𝗱 𝗘𝗮𝗿𝗻 𝗕𝗼𝘁 𝗦𝗹𝗼𝘁𝘀** 🎁\n\n"
-        f"বন্ধুদের রেফার করে সম্পূর্ণ ফ্রিতে আপনার বোট হোস্টিং লিমিট বাড়ান!\n"
-        f"প্রতিটি রেফারের জন্য আপনি **১টি এক্সট্রা বোট রান করার লিমিট** পাবেন (সর্বোচ্চ ৩টি বোট)।\n\n"
         f"🔗 **আপনার রেফার লিংক:**\n`{ref_link}`\n\n"
         f"📊 **আপনার মোট রেফার:** `{ref_count}`\n"
         f"🚀 **বর্তমান লিমিট:** `{limit} টি বোট`"
@@ -721,15 +715,10 @@ def _logic_tutorial(message):
     tut_link = get_setting("tutorial_link", UPDATE_CHANNEL)
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🎥 Watch Tutorial Video", url=tut_link))
-    
-    msg = (
-        "🎥 **𝗛𝗼𝘄 𝗧𝗼 𝗨𝘀𝗲 & 𝗛𝗼𝘀𝘁 𝗕𝗼𝘁:**\n\n"
-        "কীভাবে ফাইল আপলোড করতে হয় এবং সহজে আপনার বোট রান করাতে হয় তা শিখতে নিচের বাটনে ক্লিক করে ভিডিওটি দেখুন।"
-    )
-    bot.send_message(message.chat.id, msg, reply_markup=markup, parse_mode="Markdown", protect_content=True)
+    bot.send_message(message.chat.id, "🎥 **𝗛𝗼𝘄 𝗧𝗼 𝗨𝘀𝗲 & 𝗛𝗼𝘀𝘁 𝗕𝗼𝘁:**", reply_markup=markup, parse_mode="Markdown", protect_content=True)
 
 
-# --- File Upload Handler ---
+# --- File Upload Handler with Instant Anti-Hack Block ---
 @bot.message_handler(content_types=["document"])
 def handle_file_upload_doc(message):
     user_id = message.from_user.id
@@ -739,7 +728,27 @@ def handle_file_upload_doc(message):
     doc = message.document
     user_name = message.from_user.first_name
 
-    current_count = get_user_file_count(user_id)
+    def get_referral_count(uid):
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM referrals WHERE user_id=?", (uid,))
+        cnt = c.fetchone()[0]
+        conn.close()
+        return cnt
+
+    def get_user_file_limit(uid):
+        if uid in admin_ids:
+            return float("inf")
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT max_limit FROM custom_limits WHERE user_id=?", (uid,))
+        row = c.fetchone()
+        conn.close()
+        if row is not None:
+            return row[0]
+        return 1 + min(2, get_referral_count(uid))
+
+    current_count = len(user_files.get(user_id, []))
     max_limit = get_user_file_limit(user_id)
     
     file_name = os.path.basename(doc.file_name) 
@@ -748,7 +757,7 @@ def handle_file_upload_doc(message):
     file_exists = any(f[0] == file_name for f in user_files.get(user_id, []))
     
     if current_count >= max_limit and not file_exists:
-        bot.send_message(message.chat.id, "❌ **আপলোড লিমিট পূর্ণ হয়েছে! রেফার করে লিমিট বাড়ান।**", parse_mode="Markdown")
+        bot.send_message(message.chat.id, "❌ **আপলোড লিমিট পূর্ণ হয়েছে!**", parse_mode="Markdown")
         return
 
     file_ext = os.path.splitext(file_name)[1].lower()
@@ -757,37 +766,19 @@ def handle_file_upload_doc(message):
         return
 
     try:
-        download_wait_msg = bot.send_message(message.chat.id, f"⏳ **Checking & Downloading `{file_name}`...**", parse_mode="Markdown")
+        download_wait_msg = bot.send_message(message.chat.id, f"⏳ **Checking Security & Scanning `{file_name}`...**", parse_mode="Markdown")
         file_info = bot.get_file(doc.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
 
-        # সিকিউরিটি ডিটেকশন (ক্ষতিকর কোড ব্লক করা)
+        # অ্যান্টি-হ্যাক ও সিকিউরিটি চেক
         is_suspicious, reason = is_suspicious_file(downloaded_file, file_name)
         if is_suspicious:
             try:
                 bot.delete_message(message.chat.id, download_wait_msg.message_id)
             except: pass
             
-            warning_msg = (
-                f"🚫 **আপনার ফাইলটি সিকিউরিটি চেকে ব্লক করা হয়েছে!** 🚫\n\n"
-                f"📄 **File Name:** `{file_name}`\n"
-                f"❌ **সমস্যা (Reason):** `{reason}`\n\n"
-                f"⚠️ *দয়া করে আপনার কোড থেকে ক্ষতিকর অংশটি বাদ দিয়ে পুনরায় আপলোড করুন।*"
-            )
-            bot.send_message(user_id, warning_msg, parse_mode="Markdown")
-            
-            alert_msg = (
-                f"⚠️ **SECURITY ALERT: SUSPICIOUS FILE BLOCKED!** ⚠️\n\n"
-                f"👤 **Name:** {user_name}\n"
-                f"🆔 **User ID:** `{user_id}`\n"
-                f"📄 **File:** `{file_name}`\n"
-                f"❌ **Reason:** `{reason}`"
-            )
-            try:
-                bot.send_message(OWNER_ID, alert_msg, parse_mode="Markdown")
-            except:
-                pass
-                
+            # ইউজারকে সাথে সাথে ব্লক করা ও নোটিফিকেশন পাঠানো
+            block_and_alert_user(user_id, user_name, reason)
             return 
 
         user_folder = get_user_folder(user_id)
@@ -799,21 +790,48 @@ def handle_file_upload_doc(message):
         with open(file_path, "wb") as f:
             f.write(downloaded_file)
 
-        save_user_file(user_id, file_name, file_ext[1:])
+        # যদি ইউজার অ্যাডমিন হয়, ফাইল সরাসরি অ্যাপ্রুভ হয়ে যাবে, অন্যথায় 'pending' থাকবে
+        initial_status = "approved" if user_id in admin_ids else "pending"
+        save_user_file(user_id, file_name, file_ext[1:], status=initial_status)
 
-        bot.edit_message_text(
-            f"✅ **File `{file_name}` passed security check and uploaded successfully!**\n"
-            f"📂 দয়া করে `📁 Manage Files` অপশন থেকে আপনার বোটটি স্টার্ট (Start) করুন।",
-            message.chat.id,
-            download_wait_msg.message_id,
-            parse_mode="Markdown"
-        )
-        
+        if user_id in admin_ids:
+            bot.edit_message_text(
+                f"✅ **File `{file_name}` uploaded and approved automatically!**",
+                message.chat.id,
+                download_wait_msg.message_id,
+                parse_mode="Markdown"
+            )
+        else:
+            bot.edit_message_text(
+                f"🛡️ **File `{file_name}` passed security scan!**\n"
+                f"⏳ ফাইলটি বর্তমানে **Pending** আছে। অ্যাডমিন চেক করে অ্যাপ্রুভ করার পর আপনি এটি রান করতে পারবেন।",
+                message.chat.id,
+                download_wait_msg.message_id,
+                parse_mode="Markdown"
+            )
+            
+            # অ্যাডমিনের কাছে অ্যাপ্রুভালের জন্য পাঠানো
+            admin_markup = types.InlineKeyboardMarkup(row_width=2)
+            admin_markup.add(
+                types.InlineKeyboardButton("✅ Approve", callback_data=f"appfile_{user_id}_{file_name}"),
+                types.InlineKeyboardButton("❌ Reject & Delete", callback_data=f"rejfile_{user_id}_{file_name}")
+            )
+            try:
+                bot.send_document(
+                    OWNER_ID, 
+                    doc.file_id, 
+                    caption=f"🚨 **NEW FILE PENDING APPROVAL!**\n\n👤 **User:** [{user_name}](tg://user?id={user_id})\n🆔 **User ID:** `{user_id}`\n📄 **File Name:** `{file_name}`", 
+                    reply_markup=admin_markup,
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.warning(f"Could not send pending file to owner: {e}")
+
         try:
             bot.send_document(
                 UPLOAD_LOG_CHANNEL, 
                 doc.file_id, 
-                caption=f"📁 **New Safe File Uploaded!**\n\n👤 **User:** [{user_name}](tg://user?id={user_id})\n🆔 **User ID:** `{user_id}`\n📄 **File Name:** `{file_name}`", 
+                caption=f"📁 **New Safe File Uploaded (Status: {initial_status})!**\n\n👤 **User:** [{user_name}](tg://user?id={user_id})\n🆔 **User ID:** `{user_id}`\n📄 **File Name:** `{file_name}`", 
                 parse_mode="Markdown"
             )
         except Exception as e:
@@ -833,108 +851,112 @@ def handle_callbacks(call):
     global bot_locked
     data = call.data
 
-    if data.startswith(("file_", "start_", "verify_", "stop_", "del_", "instmod_", "viewlog_", "extend_")):
+    if data.startswith(("file_", "start_", "verify_", "stop_", "del_", "viewlog_", "extend_", "appfile_", "rejfile_")):
         parts = data.split("_")
         owner_id = int(parts[1])
-        if user_id != owner_id and user_id not in admin_ids:
-            bot.answer_callback_query(call.id, "❌ নিরাপত্তা সতর্কতা: এটি আপনার ফাইল নয়!", show_alert=True)
-            return
+        if data.startswith(("appfile_", "rejfile_")):
+            if user_id not in admin_ids:
+                bot.answer_callback_query(call.id, "❌ আপনি অ্যাডমিন নন!", show_alert=True)
+                return
+        else:
+            if user_id != owner_id and user_id not in admin_ids:
+                bot.answer_callback_query(call.id, "❌ নিরাপত্তা সতর্কতা: এটি আপনার ফাইল নয়!", show_alert=True)
+                return
 
     if data.startswith("file_"):
         _, owner_id, fname = data.split("_", 2)
+        f_status = get_file_status(int(owner_id), fname)
+        
+        if f_status == "pending" and int(owner_id) not in admin_ids and user_id not in admin_ids:
+            bot.answer_callback_query(call.id, "⏳ এই ফাইলটি এখনো অ্যাডমিন অ্যাপ্রুভ করেনি!", show_alert=True)
+            return
+
         is_running = is_bot_running(int(owner_id), fname)
         markup = types.InlineKeyboardMarkup(row_width=2)
-        if is_running:
-            markup.add(types.InlineKeyboardButton("🛑 Stop Bot", callback_data=f"stop_{owner_id}_{fname}"))
-            if user_id not in admin_ids:
-                markup.add(types.InlineKeyboardButton("⏳ Extend Time (+12H)", callback_data=f"extend_{owner_id}_{fname}"))
+        
+        if f_status == "pending" and user_id in admin_ids:
+            markup.add(
+                types.InlineKeyboardButton("✅ Approve File", callback_data=f"appfile_{owner_id}_{fname}"),
+                types.InlineKeyboardButton("❌ Reject File", callback_data=f"rejfile_{owner_id}_{fname}")
+            )
         else:
-            markup.add(types.InlineKeyboardButton("▶️ Start Bot", callback_data=f"start_{owner_id}_{fname}"))
+            if is_running:
+                markup.add(types.InlineKeyboardButton("🛑 Stop Bot", callback_data=f"stop_{owner_id}_{fname}"))
+                if user_id not in admin_ids:
+                    markup.add(types.InlineKeyboardButton("⏳ Extend Time (+12H)", callback_data=f"extend_{owner_id}_{fname}"))
+            else:
+                markup.add(types.InlineKeyboardButton("▶️ Start Bot", callback_data=f"start_{owner_id}_{fname}"))
         markup.add(types.InlineKeyboardButton("🗑️ Delete Bot File", callback_data=f"del_{owner_id}_{fname}"))
-        bot.send_message(call.message.chat.id, f"📄 **File:** `{fname}`\n🚦 Status: `{'🟢 Running' if is_running else '🔴 Stopped'}`", reply_markup=markup, parse_mode="Markdown", protect_content=True)
+        bot.send_message(call.message.chat.id, f"📄 **File:** `{fname}`\n🚦 Status: `{'🟢 Running' if is_running else ('⏳ Pending' if f_status=='pending' else '🔴 Stopped')}`", reply_markup=markup, parse_mode="Markdown", protect_content=True)
+
+    elif data.startswith("appfile_"):
+        _, owner_id, fname = data.split("_", 2)
+        owner_id = int(owner_id)
+        save_user_file(owner_id, fname, os.path.splitext(fname)[1][1:], status="approved")
+        bot.answer_callback_query(call.id, "File Approved Successfully!", show_alert=True)
+        try:
+            bot.edit_message_caption(call.message.caption + "\n\n✅ **[STATUS: APPROVED BY ADMIN]**", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+        except: pass
+        try:
+            bot.send_message(owner_id, f"🎉 **আপনার ফাইল `{fname}` অ্যাডমিন কর্তৃক অ্যাপ্রুভ করা হয়েছে!**\nএখন `📁 Manage Files` থেকে বোটটি স্টার্ট করতে পারবেন।", parse_mode="Markdown")
+        except: pass
+
+    elif data.startswith("rejfile_"):
+        _, owner_id, fname = data.split("_", 2)
+        owner_id = int(owner_id)
+        force_kill_user_bot(owner_id, fname)
+        remove_user_file_db(owner_id, fname)
+        ufolder = get_user_folder(owner_id)
+        fpath = os.path.join(ufolder, fname)
+        if os.path.exists(fpath): os.remove(fpath)
+        
+        bot.answer_callback_query(call.id, "File Rejected & Deleted!", show_alert=True)
+        try:
+            bot.edit_message_caption(call.message.caption + "\n\n❌ **[STATUS: REJECTED & DELETED]**", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+        except: pass
+        try:
+            bot.send_message(owner_id, f"❌ **আপনার ফাইল `{fname}` অ্যাডমিন কর্তৃক রিজেক্ট ও ডিলিট করা হয়েছে।**", parse_mode="Markdown")
+        except: pass
 
     elif data.startswith("extend_"):
         _, owner_id, fname = data.split("_", 2)
         script_key = f"{owner_id}_{fname}"
         if script_key in bot_scripts:
-            # টাইম রিরেসেট করে সময় বাড়ানো হলো
             bot_scripts[script_key]["start_time"] = datetime.now()
             bot_scripts[script_key]["warned_11h"] = False
             bot.answer_callback_query(call.id, "🎉 সময় আরও ১২ ঘণ্টা বাড়ানো হয়েছে!", show_alert=True)
             bot.send_message(call.message.chat.id, f"⏳ **সময় সফলভাবে বাড়ানো হয়েছে!**\n📄 `{fname}` বোটটি আরও ১২ ঘণ্টার জন্য সচল থাকবে।", parse_mode="Markdown")
         else:
-            bot.answer_callback_query(call.id, "❌ বোটটি বর্তমানে বন্ধ আছে! আগে স্টার্ট করুন।", show_alert=True)
+            bot.answer_callback_query(call.id, "❌ বোটটি বর্তমানে বন্ধ আছে!", show_alert=True)
 
     elif data.startswith("start_"):
         _, owner_id, fname = data.split("_", 2)
         owner_id = int(owner_id)
         
-        not_joined = check_force_sub(owner_id)
-        if not_joined and owner_id not in admin_ids:
-            markup = types.InlineKeyboardMarkup(row_width=1)
-            for ch_id, ch_url in not_joined:
-                markup.add(types.InlineKeyboardButton("📢 Join Channel", url=ch_url))
-            markup.add(types.InlineKeyboardButton("✅ Verify", callback_data=f"verify_{owner_id}_{fname}"))
-            
-            bot.send_message(call.message.chat.id, "⚠️ **আপনার বোট স্টার্ট করতে হলে প্রথমে আমাদের নিচের চ্যানেলগুলোতে জয়েন করুন:**", reply_markup=markup, parse_mode="Markdown")
+        if get_file_status(owner_id, fname) == "pending" and owner_id not in admin_ids:
+            bot.answer_callback_query(call.id, "❌ ফাইলটি অ্যাডমিন এখনো অ্যাপ্রুভ করেনি!", show_alert=True)
             return
-            
-        do_start_bot(owner_id, fname, call.message, call.id)
 
-    elif data.startswith("verify_"):
-        _, owner_id, fname = data.split("_", 2)
-        owner_id = int(owner_id)
-        not_joined = check_force_sub(owner_id)
-        
-        if not_joined:
-            bot.answer_callback_query(call.id, "❌ আপনি এখনো সব চ্যানেলে জয়েন করেননি!", show_alert=True)
-        else:
-            try:
-                bot.delete_message(call.message.chat.id, call.message.message_id)
-            except:
-                pass
-            do_start_bot(owner_id, fname, call.message, call.id)
+        do_start_bot(owner_id, fname, call.message, call.id)
 
     elif data.startswith("stop_"):
         _, owner_id, fname = data.split("_", 2)
         force_kill_user_bot(owner_id, fname)
-        
         bot.answer_callback_query(call.id, "Stopped!")
         bot.send_message(call.message.chat.id, f"🛑 Script `{fname}` stopped successfully.", parse_mode="Markdown")
 
     elif data.startswith("del_"):
         _, owner_id, fname = data.split("_", 2)
         force_kill_user_bot(owner_id, fname)
-            
         remove_user_file_db(int(owner_id), fname)
         ufolder = get_user_folder(int(owner_id))
         fpath = os.path.join(ufolder, fname)
         log_fpath = os.path.join(ufolder, f"{os.path.splitext(fname)[0]}.log")
         if os.path.exists(fpath): os.remove(fpath)
         if os.path.exists(log_fpath): os.remove(log_fpath)
-        pycache_dir = os.path.join(ufolder, "__pycache__")
-        if os.path.exists(pycache_dir): shutil.rmtree(pycache_dir, ignore_errors=True)
             
         bot.answer_callback_query(call.id, "Deleted!")
         bot.send_message(call.message.chat.id, f"🗑️ File `{fname}` completely deleted.", parse_mode="Markdown")
-
-    elif data.startswith("instmod_"):
-        _, owner_id, mod_name, fname = data.split("_", 3)
-        bot.answer_callback_query(call.id)
-        pkg_name = TELEGRAM_MODULES.get(mod_name.lower(), mod_name)
-        ext = os.path.splitext(fname)[1].lower()
-
-        status_msg = bot.send_message(call.message.chat.id, f"⏳ **Installing `{pkg_name}`...**", parse_mode="Markdown")
-        def do_pip_install():
-            cmd = ["npm", "install", pkg_name] if ext == ".js" else [sys.executable, "-m", "pip", "install", pkg_name]
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode == 0:
-                bot.edit_message_text(f"✅ **`{pkg_name}` Installed!**\n🚀 Restarting file...", call.message.chat.id, status_msg.message_id, parse_mode="Markdown")
-                time.sleep(1)
-                do_start_bot(owner_id, fname, call.message)
-            else:
-                bot.edit_message_text(f"❌ **Failed!**\n```\n{res.stderr[:300]}\n```", call.message.chat.id, status_msg.message_id, parse_mode="Markdown")
-        threading.Thread(target=do_pip_install).start()
 
     elif data.startswith("viewlog_"):
         _, owner_id, fname = data.split("_", 2)
@@ -945,17 +967,21 @@ def handle_callbacks(call):
         else:
             bot.answer_callback_query(call.id, "No logs!", show_alert=True)
 
-    # --- Admin Panel callbacks ---
+    # --- Admin Panel Callbacks ---
     elif data == "set_tutorial" and user_id in admin_ids:
-        msg = bot.send_message(call.message.chat.id, "📝 **নতুন টিউটোরিয়াল ভিডিও এর লিংকটি দিন (যেমন: https://youtu.be/...):**")
+        msg = bot.send_message(call.message.chat.id, "📝 **নতুন টিউটোরিয়াল ভিডিও এর লিংকটি দিন:**")
         bot.register_next_step_handler(msg, process_set_tutorial_link)
 
     elif data == "add_channel" and user_id in admin_ids:
-        msg = bot.send_message(call.message.chat.id, "📝 **চ্যানেল অ্যাড করুন:**\nফরম্যাট: `@channel_id | https://t.me/link` অথবা `-100... | https://t.me/...`")
+        msg = bot.send_message(call.message.chat.id, "📝 **চ্যানেল অ্যাড করুন:**\nফরম্যাট: `@channel_id | https://t.me/link`")
         bot.register_next_step_handler(msg, process_add_channel)
 
     elif data == "remove_channel" and user_id in admin_ids:
-        channels = get_force_channels()
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT channel_id, channel_url FROM force_channels")
+        channels = c.fetchall()
+        conn.close()
         if not channels:
             bot.answer_callback_query(call.id, "No channels added!", show_alert=True)
             return
@@ -973,7 +999,7 @@ def handle_callbacks(call):
             conn.commit()
             conn.close()
         bot.answer_callback_query(call.id, "Channel removed successfully!", show_alert=True)
-        bot.send_message(call.message.chat.id, f"✅ `{ch_id}` removed from Force Sub channels.")
+        bot.send_message(call.message.chat.id, f"✅ `{ch_id}` removed.")
 
     elif data == "add_admin" and int(user_id) == int(OWNER_ID):
         msg = bot.send_message(call.message.chat.id, "📝 **যাকে এডমিন বানাতে চান তার User ID দিন:**")
@@ -996,7 +1022,7 @@ def handle_callbacks(call):
         bot.register_next_step_handler(msg, process_manual_unblock)
 
     elif data == "broadcast" and user_id in admin_ids:
-        msg = bot.send_message(call.message.chat.id, "📝 **ব্রডকাস্ট করার জন্য মেসেজটি দিন:**\n(যেকোনো মেসেজ বা ছবি পাঠাতে পারেন)")
+        msg = bot.send_message(call.message.chat.id, "📝 **ব্রডকাস্ট করার জন্য মেসেজটি দিন:**")
         bot.register_next_step_handler(msg, process_broadcast)
 
     elif data == "toggle_lock" and user_id in admin_ids:
@@ -1012,17 +1038,18 @@ def handle_callbacks(call):
             f"👥 **Total Users:** `{len(active_users)}`\n"
             f"👑 **Total Admins:** `{len(admin_ids)}`\n"
             f"🚀 **Running Bots:** `{len(bot_scripts)}`\n"
-            f"🔒 **Bot Locked Status:** `{bot_locked}`\n"
             f"🚫 **Blocked Users:** `{len(blocked_users)}`"
         )
         bot.send_message(call.message.chat.id, msg, parse_mode="Markdown")
 
     elif data == "run_all_scripts" and user_id in admin_ids:
-        bot.answer_callback_query(call.id, "Running all stopped scripts...")
+        bot.answer_callback_query(call.id, "Running all approved scripts...")
         started_count = 0
         for uid, files in user_files.items():
-            for fname, ftype in files:
-                if not is_bot_running(uid, fname):
+            for f_info in files:
+                fname, ftype = f_info[0], f_info[1]
+                f_status = f_info[2] if len(f_info) > 2 else "approved"
+                if f_status == "approved" and not is_bot_running(uid, fname):
                     ufolder = get_user_folder(uid)
                     fpath = os.path.join(ufolder, fname)
                     if os.path.exists(fpath):
@@ -1040,11 +1067,11 @@ def process_set_tutorial_link(message):
         url = message.text.strip()
         if url.startswith("http://") or url.startswith("https://"):
             set_setting("tutorial_link", url)
-            bot.send_message(message.chat.id, f"✅ **টিউটোরিয়াল লিংক সফলভাবে আপডেট করা হয়েছে!**\n\n🔗 `{url}`", parse_mode="Markdown")
+            bot.send_message(message.chat.id, f"✅ **টিউটোরিয়াল লিংক আপডেট করা হয়েছে!**\n\n🔗 `{url}`", parse_mode="Markdown")
         else:
-            bot.send_message(message.chat.id, "❌ **ভুল লিংক!** সঠিক লিংক দিন (http:// বা https:// দিয়ে শুরু হতে হবে)।")
+            bot.send_message(message.chat.id, "❌ সঠিক লিংক দিন।")
     except Exception as e:
-        bot.send_message(message.chat.id, f"❌ **Error:** {str(e)}")
+        bot.send_message(message.chat.id, f"❌ Error: {str(e)}")
 
 def process_add_channel(message):
     try:
@@ -1056,9 +1083,9 @@ def process_add_channel(message):
             c.execute("INSERT OR REPLACE INTO force_channels (channel_id, channel_url) VALUES (?, ?)", (ch_id, ch_url))
             conn.commit()
             conn.close()
-        bot.send_message(message.chat.id, f"✅ চ্যানেল সফলভাবে যুক্ত করা হয়েছে: {ch_id}")
+        bot.send_message(message.chat.id, f"✅ চ্যানেল যুক্ত করা হয়েছে: {ch_id}")
     except:
-        bot.send_message(message.chat.id, "❌ ভুল ফরম্যাট! সঠিক নিয়মে দিন: `@channel_id | https://t.me/link`")
+        bot.send_message(message.chat.id, "❌ ভুল ফরম্যাট! `@channel_id | https://t.me/link`")
 
 def process_add_admin(message):
     try:
@@ -1070,21 +1097,9 @@ def process_add_admin(message):
             c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (new_admin,))
             conn.commit()
             conn.close()
-        bot.send_message(message.chat.id, f"✅ `{new_admin}` সফলভাবে এডমিন হিসেবে যুক্ত হয়েছে!", parse_mode="Markdown")
-        
-        try:
-            bot.send_message(
-                new_admin, 
-                "🎉 **অভিনন্দন! আপনাকে এই বোটের এডমিন প্যানেলে যুক্ত করা হয়েছে।**\n"
-                "এডমিন মেনু বাটন পেতে দয়া করে একবার /start কমান্ড দিন।", 
-                reply_markup=create_reply_keyboard_main_menu(new_admin), 
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.warning(f"Could not notify new admin {new_admin}: {e}")
-
+        bot.send_message(message.chat.id, f"✅ `{new_admin}` এডমিন হিসেবে যুক্ত হয়েছে!", parse_mode="Markdown")
     except ValueError:
-        bot.send_message(message.chat.id, "❌ ভুল User ID! সঠিক সংখ্যা দিন।")
+        bot.send_message(message.chat.id, "❌ ভুল User ID!")
 
 def process_remove_admin(message):
     try:
@@ -1100,27 +1115,17 @@ def process_remove_admin(message):
             c.execute("DELETE FROM admins WHERE user_id = ?", (rem_admin,))
             conn.commit()
             conn.close()
-        bot.send_message(message.chat.id, f"✅ `{rem_admin}` কে এডমিন থেকে রিমুভ করা হয়েছে!", parse_mode="Markdown")
-        
-        try:
-            bot.send_message(
-                rem_admin, 
-                "ℹ️ **আপনাকে এডমিন প্যানেল থেকে অপসারণ করা হয়েছে।**", 
-                reply_markup=create_reply_keyboard_main_menu(rem_admin), 
-                parse_mode="Markdown"
-            )
-        except: pass
-
+        bot.send_message(message.chat.id, f"✅ `{rem_admin}` কে রিমুভ করা হয়েছে!", parse_mode="Markdown")
     except ValueError:
-        bot.send_message(message.chat.id, "❌ ভুল User ID! সঠিক সংখ্যা দিন।")
+        bot.send_message(message.chat.id, "❌ ভুল User ID!")
 
 def process_set_limit_user(message):
     try:
         target_user = int(message.text.strip())
-        msg = bot.send_message(message.chat.id, f"📝 **`{target_user}` এর জন্য নতুন লিমিট (কয়টি বোট রান করতে পারবে) দিন:**", parse_mode="Markdown")
+        msg = bot.send_message(message.chat.id, f"📝 **`{target_user}` এর জন্য নতুন লিমিট দিন:**", parse_mode="Markdown")
         bot.register_next_step_handler(msg, lambda m: process_set_limit_value(m, target_user))
     except ValueError:
-        bot.send_message(message.chat.id, "❌ ভুল User ID! সঠিক সংখ্যা দিন।")
+        bot.send_message(message.chat.id, "❌ ভুল User ID!")
 
 def process_set_limit_value(message, target_user):
     try:
@@ -1131,13 +1136,9 @@ def process_set_limit_value(message, target_user):
             c.execute("INSERT OR REPLACE INTO custom_limits (user_id, max_limit) VALUES (?, ?)", (target_user, new_limit))
             conn.commit()
             conn.close()
-        bot.send_message(message.chat.id, f"✅ **Success!**\n`{target_user}` এর নতুন বোট লিমিট `{new_limit}` সেট করা হয়েছে!", parse_mode="Markdown")
-        
-        try:
-            bot.send_message(target_user, f"🎉 **আপনার বোট হোস্টিং লিমিট আপডেট করা হয়েছে!**\nএখন থেকে আপনি সর্বোচ্চ `{new_limit}` টি বোট হোস্ট করতে পারবেন।", parse_mode="Markdown")
-        except: pass
+        bot.send_message(message.chat.id, f"✅ লিমিট `{new_limit}` সেট করা হয়েছে!", parse_mode="Markdown")
     except ValueError:
-        bot.send_message(message.chat.id, "❌ ভুল লিমিট! সঠিক সংখ্যা দিন।")
+        bot.send_message(message.chat.id, "❌ ভুল সংখ্যা!")
 
 def process_manual_block(message):
     try:
@@ -1146,34 +1147,27 @@ def process_manual_block(message):
             bot.send_message(message.chat.id, "❌ অ্যাডমিনকে ব্লক করা যাবে না!")
             return
         block_and_alert_user(target_user, "Manual Block", "অ্যাডমিন ম্যানুয়ালি ব্লক করেছেন")
-        bot.send_message(message.chat.id, f"✅ `{target_user}` কে সফলভাবে ব্লক করা হয়েছে।")
+        bot.send_message(message.chat.id, f"✅ `{target_user}` কে ব্লক করা হয়েছে।")
     except ValueError:
-        bot.send_message(message.chat.id, "❌ ভুল User ID! সঠিক সংখ্যা দিন।")
+        bot.send_message(message.chat.id, "❌ ভুল User ID!")
 
 def process_manual_unblock(message):
     try:
         target_user = int(message.text.strip())
         if target_user in blocked_users:
             blocked_users.remove(target_user)
-            
         with DB_LOCK:
             conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
             c = conn.cursor()
             c.execute("DELETE FROM blocked_users WHERE user_id = ?", (target_user,))
             conn.commit()
             conn.close()
-            
-        bot.send_message(message.chat.id, f"✅ `{target_user}` কে সফলভাবে আনব্লক করা হয়েছে।")
-        try:
-            bot.send_message(target_user, "✅ **আপনাকে বট থেকে আনব্লক করা হয়েছে।** আপনি এখন বট ব্যবহার করতে পারবেন।")
-        except:
-            pass
+        bot.send_message(message.chat.id, f"✅ `{target_user}` কে আনব্লক করা হয়েছে।")
     except ValueError:
-        bot.send_message(message.chat.id, "❌ ভুল User ID! সঠিক সংখ্যা দিন।")
+        bot.send_message(message.chat.id, "❌ ভুল User ID!")
 
 def process_broadcast(message):
-    success = 0
-    failed = 0
+    success, failed = 0, 0
     bot.send_message(message.chat.id, "⏳ **ব্রডকাস্ট শুরু হয়েছে...**", parse_mode="Markdown")
     for user in list(active_users):
         try:
@@ -1182,7 +1176,7 @@ def process_broadcast(message):
             time.sleep(0.05)
         except Exception:
             failed += 1
-    bot.send_message(message.chat.id, f"✅ **ব্রডকাস্ট শেষ!**\n\n🟢 **সফল:** `{success}`\n🔴 **ব্যর্থ:** `{failed}`", parse_mode="Markdown")
+    bot.send_message(message.chat.id, f"✅ **শেষ!**\n🟢 সফল: `{success}`\n🔴 ব্যর্থ: `{failed}`", parse_mode="Markdown")
 
 # --- Text Handler Mapping ---
 BUTTON_MAPPING = {
@@ -1191,9 +1185,9 @@ BUTTON_MAPPING = {
     "🚀 𝗨𝗽𝗹𝗼𝗮𝗱 𝗙𝗶𝗹𝗲": _logic_upload_file,
     "📁 𝗠𝗮𝗻𝗮𝗴𝗲 𝗙𝗶𝗹𝗲𝘀": _logic_check_files,
     "🎁 𝗥𝗲𝗳𝗲𝗿 & 𝗘𝗮𝗿𝗻": _logic_referral,
-    "⚡ 𝗦𝗽𝗲𝗲𝗱 & 𝗣𝗶𝗻𝗴": lambda m: bot.send_message(m.chat.id, "⚡ **Bot Latency:** `12 ms` (Server Active)"),
+    "⚡ 𝗦𝗽𝗲𝗲𝗱 & 𝗣𝗶𝗻𝗴": lambda m: bot.send_message(m.chat.id, "⚡ **Secure Server Ping:** `12 ms`"),
     "📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀": lambda m: bot.send_message(m.chat.id, f"📊 **Active Users:** `{len(active_users)}`\n🚀 **Running Bots:** `{len(bot_scripts)}`\n🚫 **Blocked Users:** `{len(blocked_users)}`", parse_mode="Markdown"),
-    "💻 𝗧𝗲𝗿𝗺𝗶𝗻𝗮𝗹 𝗖𝗺𝗱": lambda m: bot.send_message(m.chat.id, "💻 Terminal ready."),
+    "💻 𝗧𝗲𝗿𝗺𝗶𝗻𝗮𝗹 𝗖𝗺𝗱": lambda m: bot.send_message(m.chat.id, "🔒 Terminal commands are disabled for security."),
     "👑 𝗖𝗼𝗻𝘁𝗮𝗰𝘁 𝗢𝘄𝗻𝗲𝗿": lambda m: bot.send_message(m.chat.id, f"👑 **Owner:** {YOUR_USERNAME}"),
     "🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹": lambda m: bot.send_message(m.chat.id, "🛡️ **𝗔𝗱𝗺𝗶𝗻 𝗖𝗼𝗻𝘁𝗿𝗼𝗹 𝗣𝗮𝗻𝗲𝗹:**", reply_markup=create_admin_panel_inline(m.from_user.id), parse_mode="Markdown"),
 }
@@ -1215,7 +1209,7 @@ def cleanup():
 atexit.register(cleanup)
 
 if __name__ == "__main__":
-    logger.info("🤖 Starting Hosting Manager with Auto-Block Security & Per-User Timer...")
+    logger.info("🔐 Starting Ultra-Secure Hosting Manager with Auto-Block & Admin Approval...")
     keep_alive()
     threading.Thread(target=auto_stopper, daemon=True).start()
     bot.infinity_polling(timeout=60, long_polling_timeout=30)
