@@ -76,7 +76,7 @@ COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
 ADMIN_COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
     ["✨ 𝗨𝗽𝗱𝗮𝘁𝗲𝘀 𝗖𝗵𝗮𝗻𝗻𝗲𝗹 ✨", "🎥 𝗧𝘂𝘁𝗼𝗿𝗶𝗮𝗹"],
     ["🚀 𝗨𝗽𝗹𝗼𝗮𝗱 𝗙𝗶𝗹𝗲", "📁 𝗠𝗮𝗻𝗮𝗴𝗲 𝗙𝗶𝗹𝗲𝘀"],
-    ["🎁 𝗥𝗲𝗳𝗲𝗿 & 𝗘𝗮𝗿𝗻", "🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲??"],
+    ["🎁 𝗥𝗲𝗳𝗲𝗿 & 𝗘𝗮𝗿𝗻", "🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹"],
     ["⚡ 𝗦𝗽𝗲𝗲𝗱 & 𝗣𝗶𝗻𝗴", "📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀"],
     ["👑 𝗖𝗼𝗻𝘁𝗮𝗰𝘁 𝗢𝘄𝗻𝗲𝗿"],
 ]
@@ -86,10 +86,8 @@ DB_LOCK = threading.Lock()
 # --- Anti-Hack & Security Guard ---
 
 MALICIOUS_PATTERNS = [
-    r"os\.system", r"subprocess\.", r"shutil\.rmtree", r"os\.remove", r"os\.unlink",
-    r"eval\(", r"exec\(", r"open\s*\(\s*['\"]/etc", r"open\s*\(\s*['\"]/root",
-    r"process\.env", r"child_process", r"require\s*\(\s*['\"]child_process['\"]\s*\)",
-    r"import\s+pty", r"pty\.spawn", r"socket\.socket", r"os\.popen"
+    r"shutil\.rmtree", r"open\s*\(\s*['\"]/etc", r"open\s*\(\s*['\"]/root",
+    r"import\s+pty", r"pty\.spawn"
 ]
 
 def scan_file_for_malware(file_content_str):
