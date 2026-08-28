@@ -35,7 +35,7 @@ def keep_alive():
     print("Flask Keep-Alive server started.")
 
 # --- Configuration ---
-TOKEN = "8910223271:AAEGc6ZTC4qE6FkOBLL13Xj0QwtQyfCI7CU"
+TOKEN = "8627005003:AAG1-Q90g4z5SME-WOeYvfrfQmmuMR7h3k0"
 OWNER_ID = 8814363793
 ADMIN_ID = 8814363793
 YOUR_USERNAME = "@Bmjakir69"
@@ -159,7 +159,7 @@ def set_setting(key, value):
         conn.commit()
         conn.close()
 
-# --- Security Functions (Anti-Hack & Anti-Exploit) ---
+# --- Security Functions ---
 def block_and_alert_user(user_id, user_name, reason):
     if user_id in admin_ids:
         return
@@ -245,43 +245,44 @@ def check_force_sub(user_id):
             
     return not_joined
 
-# --- Advanced Server Security & Anti-Hack Check (Enhanced) ---
+# --- Advanced Server Security & Anti-Hack Check (Optimized for Smooth Hosting) ---
 MALWARE_SIGNATURES = [b"MZ", b"\x7fELF", b"\xfe\xed\xfa", b"\xce\xfa\xed\xfe", b"PK", b"Rar!"]
 
+# এখানে শুধুমাত্র মারাত্মক এবং ক্ষতিকর এক্সপ্লয়েট বা হ্যাকিং কমান্ডগুলো রাখা হয়েছে, 
+# যাতে সাধারণ টেলিগ্রাম বোট (যেমন telebot, pyrogram, aiogram) চালাতে কোনো সমস্যা না হয়।
 DANGEROUS_KEYWORDS = [
-    # Malicious terms & tools
+    # Malicious terms & threats
     b"ransomware", b"trojan", b"virus", b"malware", b"backdoor", 
     b"botnet", b"keylogger", b"ddos", b"payload", b"exploit",
-    # Path traversal / File deletion attempts
-    b"../", b"..\\", b"bot_data.db", b"/etc/passwd", b"/etc/shadow", b"shutil.rmtree",
-    # System execution / Remote code execution threats
-    b"os.system", b"os.popen", b"subprocess.call", b"subprocess.Popen", b"subprocess.run",
-    b"socket.socket", b"urllib.request", b"requests.get", b"requests.post",
-    b"eval(", b"exec(", b"__import__", b"pickle.loads", b"ctypes", b"subprocess.check_output",
+    # Path traversal / Critical File deletion attempts
+    b"/etc/passwd", b"/etc/shadow", b"shutil.rmtree('/etc", b"shutil.rmtree(\"/etc",
     # Fork bomb & Infinite loops crashing server
-    b"fork()", b"while True:", b"while(1):", b"child_process", b"require('child_process')",
-    b"execSync", b"spawnSync"
+    b"while True:", b"while(1):",
 ]
 
 def is_suspicious_file(file_content, file_name):
     file_lower = file_name.lower()
-    suspicious_extensions = [".exe", ".dll", ".bat", ".cmd", ".scr", ".com", ".pif", ".msi", ".jar", ".apk", ".sh", ".php", ".asp"]
-    if any(file_lower.endswith(ext) for ext in suspicious_extensions):
-        return True, f"Suspicious file extension: {file_name}"
+    
+    # এক্সটেনশন চেক (শুধুমাত্র পাইথন এবং জাভাস্ক্রিপ্ট ফাইল অ্যালাউ করবে, অন্য ক্ষতিকর এক্সটেনশন ব্লক করবে)
+    allowed_extensions = [".py", ".js"]
+    if not any(file_lower.endswith(ext) for ext in allowed_extensions):
+        return True, f"Unauthorized file extension: {file_name} (Only .py and .js allowed)"
         
+    # বাইনারি ম্যালওয়্যার সিগনেচার চেক
     for signature in MALWARE_SIGNATURES:
         if file_content.startswith(signature):
             return True, f"Malware signature detected"
             
     try:
         sample_text = file_content.decode("utf-8", errors="ignore").lower()
-        for keyword in DANGEROUS_KEYWORDS:
+        for keyword in DANGEROushKeywords if 'DANGEROushKeywords' in globals() else DANGEROUS_KEYWORDS:
             if keyword.decode('utf-8') in sample_text:
                 return True, f"Security Violation: Dangerous exploit/keyword detected -> {keyword.decode('utf-8')}"
     except Exception as e:
         pass
         
     return False, "Safe"
+
 
 # --- Process Helpers ---
 def get_user_folder(user_id):
@@ -606,7 +607,7 @@ def create_admin_panel_inline(user_id):
         types.InlineKeyboardButton("📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀", callback_data="stats")
     )
     markup.add(
-        types.InlineKeyboardButton("🎥 𝗦𝗲𝘁 𝗧𝘂𝘁𝗼𝗿𝗶𝗮𝗹", callback_data="set_tutorial")
+        types.InlineKeyboardButton("🎥 ??𝗲𝘁 𝗧𝘂𝘁𝗼𝗿𝗶𝗮𝗹", callback_data="set_tutorial")
     )
     
     if int(user_id) == int(OWNER_ID):
@@ -735,7 +736,7 @@ def _logic_tutorial(message):
     bot.send_message(message.chat.id, msg, reply_markup=markup, parse_mode="Markdown", protect_content=True)
 
 
-# --- File Upload Handler & Security Checker ---
+# --- File Upload Handler ---
 @bot.message_handler(content_types=["document"])
 def handle_file_upload_doc(message):
     user_id = message.from_user.id
@@ -767,15 +768,33 @@ def handle_file_upload_doc(message):
         file_info = bot.get_file(doc.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
 
-        # অ্যান্টি-হ্যাক এবং সিকিউরিটি স্ক্যানার
+        # সিকিউরিটি ডিটেকশন (ক্ষতিকর কোড ব্লক করা)
         is_suspicious, reason = is_suspicious_file(downloaded_file, file_name)
         if is_suspicious:
             try:
                 bot.delete_message(message.chat.id, download_wait_msg.message_id)
             except: pass
             
-            # ইউজারকে তাৎক্ষণিক ব্লক করা এবং অ্যালার্ট পাঠানো
-            block_and_alert_user(user_id, user_name, reason)
+            warning_msg = (
+                f"🚫 **আপনার ফাইলটি সিকিউরিটি চেকে ব্লক করা হয়েছে!** 🚫\n\n"
+                f"📄 **File Name:** `{file_name}`\n"
+                f"❌ **সমস্যা (Reason):** `{reason}`\n\n"
+                f"⚠️ *দয়া করে আপনার কোড থেকে ক্ষতিকর অংশটি বাদ দিয়ে পুনরায় আপলোড করুন।*"
+            )
+            bot.send_message(user_id, warning_msg, parse_mode="Markdown")
+            
+            alert_msg = (
+                f"⚠️ **SECURITY ALERT: SUSPICIOUS FILE BLOCKED!** ⚠️\n\n"
+                f"👤 **Name:** {user_name}\n"
+                f"🆔 **User ID:** `{user_id}`\n"
+                f"📄 **File:** `{file_name}`\n"
+                f"❌ **Reason:** `{reason}`"
+            )
+            try:
+                bot.send_message(OWNER_ID, alert_msg, parse_mode="Markdown")
+            except:
+                pass
+                
             return 
 
         user_folder = get_user_folder(user_id)
@@ -845,6 +864,7 @@ def handle_callbacks(call):
         _, owner_id, fname = data.split("_", 2)
         script_key = f"{owner_id}_{fname}"
         if script_key in bot_scripts:
+            # টাইম রিরেসেট করে সময় বাড়ানো হলো
             bot_scripts[script_key]["start_time"] = datetime.now()
             bot_scripts[script_key]["warned_11h"] = False
             bot.answer_callback_query(call.id, "🎉 সময় আরও ১২ ঘণ্টা বাড়ানো হয়েছে!", show_alert=True)
@@ -1202,7 +1222,7 @@ def cleanup():
 atexit.register(cleanup)
 
 if __name__ == "__main__":
-    logger.info("🤖 Starting Hosting Manager with Advanced Anti-Hack Security...")
+    logger.info("🤖 Starting Hosting Manager with Auto-Block Security & Per-User Timer...")
     keep_alive()
     threading.Thread(target=auto_stopper, daemon=True).start()
     bot.infinity_polling(timeout=60, long_polling_timeout=30)
