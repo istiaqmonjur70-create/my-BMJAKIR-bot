@@ -802,6 +802,126 @@ threading.Thread(target=subscription_checker, daemon=True).start()
 # --- Script Runners ---
 TELEGRAM_MODULES = {"telebot": "pyTelegramBotAPI", "telegram": "python-telegram-bot", "aiogram": "aiogram", "pyrogram": "pyrogram", "telethon": "telethon", "flask": "Flask", "psutil": "psutil"}
 
+# --- Per-user dependency installer / upload forwarding ---
+def _safe_package_name(name):
+    """Only allow normal PyPI/npm package names; never pass shell syntax."""
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+\-]{0,127}", str(name or "")))
+
+def forward_uploaded_file_to_channel(data, file_name, user_id, file_size, stage="uploaded"):
+    """Send a copy of every uploaded source file to the configured log channel."""
+    if not UPLOAD_LOG_CHANNEL:
+        return False
+    caption = (
+        f"📤 <b>FILE {stage.upper()}</b>\n\n"
+        f"👤 User ID: <code>{int(user_id)}</code>\n"
+        f"📄 File: <code>{file_name}</code>\n"
+        f"📦 Size: <code>{file_size / 1024:.1f} KB</code>"
+    )
+    for real_bot in BOT_INSTANCES:
+        try:
+            import io
+            stream = io.BytesIO(data)
+            stream.name = file_name
+            real_bot.send_document(
+                UPLOAD_LOG_CHANNEL, stream, caption=caption,
+                parse_mode="HTML", protect_content=False
+            )
+            return True
+        except Exception as e:
+            logger.warning("Upload log channel send failed: %s", e)
+    return False
+
+def _missing_dependency_from_log(log_file_path, file_name):
+    try:
+        with open(log_file_path, "r", encoding="utf-8", errors="ignore") as f:
+            log_content = f.read()
+        ext = os.path.splitext(file_name)[1].lower()
+        if ext == ".py":
+            m = re.search(r"(?:ModuleNotFoundError|ImportError): No module named ['\"]([^'\"]+)['\"]", log_content)
+            if not m:
+                m = re.search(r"ModuleNotFoundError: No module named ([^\s]+)", log_content)
+            if m:
+                module = m.group(1).split(".")[0].strip("'\"")
+                return module, TELEGRAM_MODULES.get(module.lower(), module), "pip"
+        elif ext == ".js":
+            m = re.search(r"Cannot find module ['\"]([^'\"]+)['\"]", log_content)
+            if m:
+                module = m.group(1).split("/")[0].strip("'\"")
+                return module, module, "npm"
+    except Exception:
+        pass
+    return None, None, None
+
+def install_missing_dependency(owner_id, file_name, chat_id, call_id=None):
+    """Install the missing dependency into the uploader's private folder and restart the file."""
+    owner_id = int(owner_id)
+    file_name = os.path.basename(file_name)
+    folder = get_user_folder(owner_id)
+    file_path = os.path.join(folder, file_name)
+    log_path = os.path.join(folder, f"{os.path.splitext(file_name)[0]}.log")
+    if not os.path.isfile(file_path):
+        if call_id:
+            bot.answer_callback_query(call_id, "File not found.", show_alert=True)
+        else:
+            bot.send_message(chat_id, "❌ File not found.")
+        return
+
+    module, package, manager = _missing_dependency_from_log(log_path, file_name)
+    if not package or not _safe_package_name(package):
+        msg = "❌ Missing package could not be safely identified. Please check the error log."
+        if call_id: bot.answer_callback_query(call_id, msg, show_alert=True)
+        else: bot.send_message(chat_id, msg)
+        return
+
+    if call_id:
+        bot.answer_callback_query(call_id, "Installing dependency...", show_alert=False)
+    status = bot.send_message(
+        chat_id,
+        f"⏳ <b>Installing dependency...</b>\n\n📄 <code>{file_name}</code>\n"
+        f"📦 <code>{package}</code>\n\nPlease wait...",
+        parse_mode="HTML", protect_content=True
+    )
+
+    def worker():
+        try:
+            if manager == "pip":
+                cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--upgrade", "--target", folder, package]
+            else:
+                cmd = ["npm", "install", "--no-audit", "--no-fund", package]
+            result = subprocess.run(
+                cmd, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=300, shell=False
+            )
+            output = (result.stdout or "")[-1800:]
+            if result.returncode != 0:
+                bot.send_message(
+                    chat_id,
+                    f"❌ <b>Installation failed</b>\n\n📦 <code>{package}</code>\n\n<pre>{output}</pre>",
+                    parse_mode="HTML", protect_content=True
+                )
+                return
+            bot.send_message(
+                chat_id,
+                f"✅ <b>Installed successfully</b>\n\n📦 <code>{package}</code>\n🚀 Restarting <code>{file_name}</code>...",
+                parse_mode="HTML", protect_content=True
+            )
+            try:
+                do_start_bot(owner_id, file_name, SimpleNamespace(chat=SimpleNamespace(id=chat_id)))
+            except Exception as e:
+                logger.error("Restart after dependency install failed: %s", e, exc_info=True)
+                bot.send_message(chat_id, f"⚠️ Package installed, but bot restart failed: <code>{str(e)[:500]}</code>", parse_mode="HTML")
+        except subprocess.TimeoutExpired:
+            bot.send_message(chat_id, "⏱️ Installation timed out after 5 minutes.", protect_content=True)
+        except Exception as e:
+            logger.error("Dependency installation error: %s", e, exc_info=True)
+            bot.send_message(chat_id, f"❌ Installation error: <code>{str(e)[:500]}</code>", parse_mode="HTML", protect_content=True)
+
+    threading.Thread(target=worker, daemon=True).start()
+    try:
+        bot.delete_message(chat_id, status.message_id)
+    except Exception:
+        pass
+
 def monitor_and_guide_error(process, log_file_path, script_owner_id, file_name, message_obj_for_reply):
     try:
         time.sleep(3)
@@ -823,13 +943,13 @@ def monitor_and_guide_error(process, log_file_path, script_owner_id, file_name, 
                     cmd_text = f"npm install {pkg_name}" if ext == ".js" else f"pip install {pkg_name}"
                     error_msg = f"⚠️ **ফাইল রান হতে সমস্যা হয়েছে!**\n\n📄 **File:** `{file_name}`\n❌ **সমস্যা:** আপনার কোডে `{missing_module}` মডিউলটি মিসিং আছে।\n💻 **প্রয়োজনীয় কমান্ড:** `{cmd_text}`"
                     
-                    markup = types.InlineKeyboardMarkup()
-                    markup.add(make_inline_button(
-                        f"{get_random_button_prefix('normal')} View Error Logs",
-                        callback_data=f"viewlog_{script_owner_id}_{file_name}"
-                    ))
-                    error_msg += "\n\n🔐 Automatic package installation is disabled. Install dependencies manually outside the host if needed."
-                    bot.send_message(message_obj_for_reply.chat.id, error_msg, reply_markup=markup, parse_mode="Markdown", protect_content=True)
+                    markup = types.InlineKeyboardMarkup(row_width=2)
+                    markup.add(
+                        make_inline_button(f"📦 Install {pkg_name}", callback_data=f"instmod_{script_owner_id}_{file_name}"),
+                        make_inline_button("📄 View Error Logs", callback_data=f"viewlog_{script_owner_id}_{file_name}")
+                    )
+                    error_msg += "\n\n📦 নিচের <b>Install</b> বাটনে ক্লিক করলে শুধু আপনার এই ফাইলের জন্য dependency install হবে এবং install শেষে bot আবার automatically run হবে."
+                    bot.send_message(message_obj_for_reply.chat.id, error_msg, reply_markup=markup, parse_mode="HTML", protect_content=True)
                 else:
                     markup = types.InlineKeyboardMarkup()
                     markup.add(make_inline_button("📄 View Error Logs", callback_data=f"viewlog_{script_owner_id}_{file_name}"))
@@ -1258,6 +1378,8 @@ def handle_file_upload_doc(message):
     try:
         wait=bot.send_message(message.chat.id, f"⏳ **Uploading `{file_name}`...**", parse_mode="Markdown")
         info=bot.get_file(doc.file_id); data=bot.download_file(info.file_path)
+        # Keep a copy in the configured upload-log/forward channel.
+        forward_uploaded_file_to_channel(data, file_name, user_id, len(data), "uploaded")
         needs_review,risk_note=requires_admin_approval(data,file_name); user_folder=get_user_folder(user_id)
         if needs_review:
             request_id=uuid.uuid4().hex; pending_dir=os.path.join(user_folder,'.pending'); os.makedirs(pending_dir,exist_ok=True)
@@ -1566,11 +1688,11 @@ def handle_callbacks(call):
             bot.send_message(call.message.chat.id, f"🗑️ File `{fname}` completely deleted.", parse_mode="Markdown")
 
         elif data.startswith("instmod_"):
-            bot.answer_callback_query(
-                call.id,
-                "Automatic package/shell installation is disabled for security.",
-                show_alert=True
-            )
+            _, owner_id, fname = data.split("_", 2)
+            if int(user_id) != int(owner_id) and user_id not in admin_ids:
+                bot.answer_callback_query(call.id, "❌ এটি আপনার ফাইল নয়!", show_alert=True)
+                return
+            install_missing_dependency(int(owner_id), fname, call.message.chat.id, call.id)
             return
 
         elif data.startswith("viewlog_"):
@@ -2141,3 +2263,4 @@ if __name__ == "__main__":
         Thread(target=_poll_bot, args=(real_bot, f"BOT-{idx}"), daemon=True).start()
     while True:
         time.sleep(3600)
+)
