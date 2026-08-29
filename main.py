@@ -2141,4 +2141,3 @@ if __name__ == "__main__":
         Thread(target=_poll_bot, args=(real_bot, f"BOT-{idx}"), daemon=True).start()
     while True:
         time.sleep(3600)
-0)
