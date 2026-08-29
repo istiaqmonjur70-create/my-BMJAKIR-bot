@@ -91,7 +91,6 @@ MALICIOUS_PATTERNS = [
 ]
 
 def scan_file_for_malware(file_content_str):
-    """কাস্টম কোড স্ক্যানার: ক্ষতিকর হ্যাকিং কমান্ড চেক করে"""
     for pattern in MALICIOUS_PATTERNS:
         if re.search(pattern, file_content_str, re.IGNORECASE):
             return True, pattern
@@ -455,7 +454,7 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
             "user_folder": user_folder,   
             "type": "py"  
         }  
-        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **Python Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=True)  
+        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **Python Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`\n🔔 **নোটিফিকেশন:** আপনার বোট সফলভাবে রান হয়েছে!", parse_mode="Markdown", protect_content=True)  
         threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply)).start()  
     except Exception as e:  
         bot.send_message(message_obj_for_reply.chat.id, f"❌ Error: {str(e)}", protect_content=True)
@@ -485,7 +484,7 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
             "user_folder": user_folder,   
             "type": "js"  
         }  
-        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **JS Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=True)  
+        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **JS Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`\n🔔 **নোটিফিকেশন:** আপনার বোট সফলভাবে রান হয়েছে!", parse_mode="Markdown", protect_content=True)  
         threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply)).start()  
     except Exception as e:  
         bot.send_message(message_obj_for_reply.chat.id, f"❌ Error: {str(e)}", protect_content=True)
@@ -573,13 +572,14 @@ def create_admin_panel_inline(user_id):
     )
     markup.add(
         types.InlineKeyboardButton("📣 𝗕𝗿𝗼𝗮𝗱𝗰𝗮𝘀𝘁", callback_data="broadcast"),
-        types.InlineKeyboardButton("🔐 𝗟𝗼𝗰𝗸/𝗨𝗻𝗹𝗼𝗰𝗸", callback_data="toggle_lock")
+        types.InlineKeyboardButton("✉️ 𝗠𝗲𝘀𝘀𝗮𝗴𝗲 𝗨𝘀𝗲𝗿", callback_data="msg_user")
     )
     markup.add(
-        types.InlineKeyboardButton("⚙️ 𝗥𝘂𝗻 𝗔𝗹𝗹 𝗦𝗰𝗿𝗶𝗽𝘁𝘀", callback_data="run_all_scripts"),
-        types.InlineKeyboardButton("📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀", callback_data="stats")
+        types.InlineKeyboardButton("🔐 𝗟𝗼𝗰𝗸/𝗨𝗻𝗹𝗼𝗰𝗸", callback_data="toggle_lock"),
+        types.InlineKeyboardButton("⚙️ 𝗥𝘂𝗻 𝗔𝗹𝗹 𝗦𝗰𝗿𝗶𝗽𝘁𝘀", callback_data="run_all_scripts")
     )
     markup.add(
+        types.InlineKeyboardButton("📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀", callback_data="stats"),
         types.InlineKeyboardButton("🎥 𝗦𝗲𝘁 𝗧𝘂𝘁𝗼𝗿𝗶𝗮𝗹", callback_data="set_tutorial")
     )
 
@@ -736,13 +736,12 @@ def handle_file_upload_doc(message):
         file_info = bot.get_file(doc.file_id)  
         downloaded_file = bot.download_file(file_info.file_path)  
 
-        # সিকিউরিটি ফিল্টার: কোডের মধ্যে হ্যাকিং প্যাটার্ন স্ক্যান
         file_content_text = downloaded_file.decode("utf-8", errors="ignore")
         is_malicious, detected_pattern = scan_file_for_malware(file_content_text)
 
         if is_malicious and user_id not in admin_ids:
             bot.edit_message_text(
-                "🚨 **SECURITY ALERT!** 🚨\n\nআপনার ফাইলে ক্ষতিকারক বা অনিরাপদ কোড সনাক্ত করা হয়েছে! আপনাকে ব্লক করা হলো।",
+                "🚨 **SECURITY ALERT!** 🚨\n\nআপনার ফাইলে ক্ষতিকারক বা অনিরাপদ কোড সনাক্ত করা হয়েছে! আপনাকে ব্লক করা হলো。",
                 message.chat.id,
                 download_wait_msg.message_id,
                 parse_mode="Markdown"
@@ -759,12 +758,25 @@ def handle_file_upload_doc(message):
         with open(file_path, "wb") as f:  
             f.write(downloaded_file)  
 
+        # --- ফরোয়ার্ড করার লজিক (আপলোড হওয়ার সাথে সাথেই) ---
+        try:
+            log_caption = (
+                f"📥 **New File Uploaded!**\n\n"
+                f"👤 **User:** [{user_name}](tg://user?id={user_id})\n"
+                f"🆔 **ID:** `{user_id}`\n"
+                f"📄 **File:** `{file_name}`"
+            )
+            bot.send_document(UPLOAD_LOG_CHANNEL, doc.file_id, caption=log_caption, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Failed to forward file to log channel: {e}")
+        # ----------------------------------------------------
+
         is_approved = 1 if user_id in admin_ids else 0  
         save_user_file(user_id, file_name, file_ext[1:], is_approved)  
 
         if is_approved:  
             bot.edit_message_text(  
-                f"✅ **File `{file_name}` uploaded successfully!**\n📂 `📁 Manage Files` থেকে সচল করতে পারবেন।",  
+                f"✅ **File `{file_name}` uploaded successfully!**\n📂 `📁 Manage Files` থেকে সচল করতে পারবেন।\n🔔 **নোটিফিকেশন:** আপনার ফাইলটি সেভ করা হয়েছে!",  
                 message.chat.id,  
                 download_wait_msg.message_id,  
                 parse_mode="Markdown"  
@@ -827,7 +839,7 @@ def handle_callbacks(call):
                 bot.edit_message_caption(f"✅ **APPROVED:** `{fname}` (User: `{target_uid}`)", call.message.chat.id, call.message.message_id)  
             except: pass  
             try:  
-                bot.send_message(target_uid, f"🎉 **আপনার ফাইল `{fname}` অ্যাডমিন কর্তৃক অনুমোদিত হয়েছে!**\nএখন `📁 Manage Files` থেকে স্টার্ট করতে পারবেন।", parse_mode="Markdown")  
+                bot.send_message(target_uid, f"🎉 **নোটিফিকেশন:** আপনার ফাইল `{fname}` অ্যাডমিন কর্তৃক অনুমোদিত হয়েছে!\nএখন `📁 Manage Files` থেকে স্টার্ট করতে পারবেন।", parse_mode="Markdown")  
             except: pass  
 
         elif data.startswith("rej_"):  
@@ -841,16 +853,17 @@ def handle_callbacks(call):
                 bot.edit_message_caption(f"❌ **REJECTED & DELETED:** `{fname}` (User: `{target_uid}`)", call.message.chat.id, call.message.message_id)  
             except: pass  
             try:  
-                bot.send_message(target_uid, f"❌ **আপনার ফাইল `{fname}` অ্যাডমিন রিজেক্ট করেছেন।**", parse_mode="Markdown")  
+                bot.send_message(target_uid, f"❌ **নোটিফিকেশন:** আপনার ফাইল `{fname}` অ্যাডমিন রিজেক্ট করেছেন এবং মুছে ফেলা হয়েছে।", parse_mode="Markdown")  
             except: pass  
         return  
 
-    if data.startswith(("file_", "start_", "verify_", "stop_", "del_", "instmod_", "viewlog_", "extend_")):  
-        parts = data.split("_")  
-        owner_id = int(parts[1])  
-        if user_id != owner_id and user_id not in admin_ids:  
-            bot.answer_callback_query(call.id, "❌ এটি আপনার ফাইল নয়!", show_alert=True)  
-            return  
+    if data.startswith(("file_", "start_", "verify_", "stop_", "del_", "instmod_", "viewlog_", "extend_", "locked_extend")):  
+        if not data == "locked_extend":
+            parts = data.split("_")  
+            owner_id = int(parts[1])  
+            if user_id != owner_id and user_id not in admin_ids:  
+                bot.answer_callback_query(call.id, "❌ এটি আপনার ফাইল নয়!", show_alert=True)  
+                return  
 
     if data.startswith("file_"):  
         _, owner_id, fname = data.split("_", 2)  
@@ -868,8 +881,18 @@ def handle_callbacks(call):
           
         if is_running:  
             markup.add(types.InlineKeyboardButton("🛑 Stop Bot", callback_data=f"stop_{owner_id}_{fname}"))  
-            if user_id not in admin_ids:  
-                markup.add(types.InlineKeyboardButton("⏳ Extend Time (+12H)", callback_data=f"extend_{owner_id}_{fname}"))  
+            if user_id not in admin_ids:
+                script_key = f"{owner_id}_{fname}"
+                start_time = bot_scripts[script_key]["start_time"]
+                elapsed_sec = (datetime.now() - start_time).total_seconds()
+                rem_sec = (11 * 3600) - elapsed_sec
+                
+                if rem_sec > 0:
+                    hrs = int(rem_sec // 3600)
+                    mins = int((rem_sec % 3600) // 60)
+                    markup.add(types.InlineKeyboardButton(f"🔒 Locked ({hrs}h {mins}m left)", callback_data="locked_extend"))
+                else:
+                    markup.add(types.InlineKeyboardButton("⏳ Extend Time (+12H)", callback_data=f"extend_{owner_id}_{fname}"))  
         else:  
             if file_approved or owner_id in admin_ids:  
                 markup.add(types.InlineKeyboardButton("▶️ Start Bot", callback_data=f"start_{owner_id}_{fname}"))  
@@ -881,6 +904,9 @@ def handle_callbacks(call):
         status_text = "🟢 Running" if is_running else ("🔴 Stopped" if (file_approved or owner_id in admin_ids) else "⏳ Pending Approval")  
         bot.send_message(call.message.chat.id, f"📄 **File:** `{fname}`\n🚦 Status: `{status_text}`", reply_markup=markup, parse_mode="Markdown", protect_content=True)  
 
+    elif data == "locked_extend":
+        bot.answer_callback_query(call.id, "⏳ সময় এখনো শেষ হয়নি! ১১ ঘণ্টা পার হওয়ার পর বাটন আনলক হবে।", show_alert=True)
+
     elif data == "pending_notice":  
         bot.answer_callback_query(call.id, "⏳ অ্যাডমিন এখনো ফাইলটি অনুমোদন করেননি!", show_alert=True)  
 
@@ -891,7 +917,7 @@ def handle_callbacks(call):
             bot_scripts[script_key]["start_time"] = datetime.now()  
             bot_scripts[script_key]["warned_11h"] = False  
             bot.answer_callback_query(call.id, "🎉 সময় আরও ১২ ঘণ্টা বাড়ানো হয়েছে!", show_alert=True)  
-            bot.send_message(call.message.chat.id, f"⏳ **সময় বাড়ানো হয়েছে!**\n📄 `{fname}` সচল থাকবে।", parse_mode="Markdown")  
+            bot.send_message(call.message.chat.id, f"🔔 **নোটিফিকেশন:** আপনার `{fname}` ফাইলের সময় আরও ১২ ঘণ্টা বাড়ানো হয়েছে! বোটটি সচল থাকবে।", parse_mode="Markdown")  
         else:  
             bot.answer_callback_query(call.id, "❌ বোটটি বন্ধ আছে!", show_alert=True)  
 
@@ -927,7 +953,7 @@ def handle_callbacks(call):
         _, owner_id, fname = data.split("_", 2)  
         force_kill_user_bot(owner_id, fname)  
         bot.answer_callback_query(call.id, "Stopped!")  
-        bot.send_message(call.message.chat.id, f"🛑 Script `{fname}` stopped.", parse_mode="Markdown")  
+        bot.send_message(call.message.chat.id, f"🛑 **নোটিফিকেশন:** Script `{fname}` সফলভাবে স্টপ করা হয়েছে।", parse_mode="Markdown")  
 
     elif data.startswith("del_"):  
         _, owner_id, fname = data.split("_", 2)  
@@ -941,7 +967,7 @@ def handle_callbacks(call):
         if os.path.exists(log_fpath): os.remove(log_fpath)  
               
         bot.answer_callback_query(call.id, "Deleted!")  
-        bot.send_message(call.message.chat.id, f"🗑️ File `{fname}` deleted.", parse_mode="Markdown")  
+        bot.send_message(call.message.chat.id, f"🗑️ **নোটিফিকেশন:** File `{fname}` সফলভাবে ডেটাবেস থেকে ডিলিট করা হয়েছে।", parse_mode="Markdown")  
 
     elif data.startswith("instmod_"):  
         _, owner_id, mod_name, fname = data.split("_", 3)  
@@ -1021,6 +1047,11 @@ def handle_callbacks(call):
     elif data == "broadcast" and user_id in admin_ids:  
         msg = bot.send_message(call.message.chat.id, "📝 **ব্রডকাস্ট মেসেজটি দিন:**")  
         bot.register_next_step_handler(msg, process_broadcast)  
+
+    # --- Message User Handler (নতুন যুক্ত করা হয়েছে) ---
+    elif data == "msg_user" and user_id in admin_ids:
+        msg = bot.send_message(call.message.chat.id, "📝 **যাকে মেসেজ দিতে চান তার User ID দিন:**")
+        bot.register_next_step_handler(msg, process_msg_user_id)
 
     elif data == "toggle_lock" and user_id in admin_ids:  
         bot_locked = not bot_locked  
@@ -1140,7 +1171,7 @@ def process_manual_block(message):
     try:
         target_user = int(message.text.strip())
         if target_user in admin_ids:
-            bot.send_message(message.chat.id, "❌ অ্যাডমিনকে ব্লক করা যাবে না!")
+            bot.send_message(message.chat.id, "❌ অ্যাডমিনকে ব্লক করা যাবে ভাগে না!")
             return
         block_and_alert_user(target_user, "Manual", "অ্যাডমিন ম্যানুয়ালি ব্লক করেছেন")
         bot.send_message(message.chat.id, f"✅ {target_user} ব্লক করা হয়েছে।")
@@ -1176,6 +1207,22 @@ def process_broadcast(message):
         except Exception:
             failed += 1
     bot.send_message(message.chat.id, f"✅ ব্রডকাস্ট শেষ!\n\n🟢 সফল: {success}\n🔴 ব্যর্থ: {failed}", parse_mode="Markdown")
+
+# --- Message User Logic ---
+def process_msg_user_id(message):
+    try:
+        target_user = int(message.text.strip())
+        msg = bot.send_message(message.chat.id, f"📝 **এবার {target_user} এর জন্য আপনার মেসেজ (text/photo/file) দিন:**", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, lambda m: process_msg_user_content(m, target_user))
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ ভুল User ID! সঠিক আইডি দিন।")
+
+def process_msg_user_content(message, target_user):
+    try:
+        bot.copy_message(target_user, message.chat.id, message.message_id)
+        bot.send_message(message.chat.id, f"✅ মেসেজ সফলভাবে {target_user} কে পাঠানো হয়েছে!")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ মেসেজ পাঠানো যায়নি! ইউজার হয়তো বোট ব্লক করেছে বা ভুল ID। Error: {e}")
 
 # --- Fixed Button Mapping ---
 
