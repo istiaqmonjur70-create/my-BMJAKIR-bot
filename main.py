@@ -43,7 +43,7 @@ def keep_alive():
 TOKEN = "8910223271:AAEGc6ZTC4qE6FkOBLL13Xj0QwtQyfCI7CU"
 OWNER_ID = 8814363793
 ADMIN_ID = 8814363793
-YOUR_USERNAME = "@Bmjakir69"
+YOUR_USERNAME = "@DevCloudX"
 UPDATE_CHANNEL = "https://t.me/JAKIRLABS"
 UPLOAD_LOG_CHANNEL = "@ajajakkalqkqkqjajakl" # ফাইল আপলোড নোটিফিকেশন চ্যানেল
 
@@ -2209,7 +2209,7 @@ def handle_text_messages(message):
 # Keep these values after the main code as requested.
 # Replace only the two placeholders below.
 # =====================================================================
-SECOND_BOT_TOKEN = "8910223271:AAEGc6ZTC4qE6FkOBLL13Xj0QwtQyfCI7CU"
+SECOND_BOT_TOKEN = "8975915610:AAFyMVM5vFyfWNurx-uUKaEj3bU_zC2LUPU"
 SECOND_ADMIN_ID = 8814363793
 
 APPROVAL_ADMIN_IDS = {int(OWNER_ID), int(ADMIN_ID)}
@@ -2245,7 +2245,6 @@ _register_proxy_handlers()
 def _poll_bot(real_bot, label):
     bot.bind(real_bot)
     logger.info("%s polling started.", label)
-    real_bot.remove_webhook()
     while True:
         try:
             real_bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
@@ -2255,7 +2254,6 @@ def _poll_bot(real_bot, label):
         except Exception as e:
             logger.error("%s polling error: %s", label, e)
             time.sleep(15)
-
 
 if __name__ == "__main__":
     keep_alive()
