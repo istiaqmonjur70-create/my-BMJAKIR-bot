@@ -24,7 +24,7 @@ app = Flask("")
 
 @app.route("/")
 def home():
-    return "I'm CHS File Host - Running Successfully"
+    return "I'm Mukesh File Host - Running Successfully"
 
 def run_flask():
     try:
@@ -40,19 +40,19 @@ def keep_alive():
     print("Flask Keep-Alive server started.")
 
 # --- Configuration ---
-TOKEN = "8856143574:AAH34gOh_iYVIyktjKZvKVtoEKXtxYny0Co"
-OWNER_ID = 8889726455
-ADMIN_ID = 6442375982
-YOUR_USERNAME = "@ModderSanto"
-UPDATE_CHANNEL = "https://t.me/ModderSanto_Official"
-UPLOAD_LOG_CHANNEL = "@all0notification" # ফাইল আপলোড নোটিফিকেশন চ্যানেল
+TOKEN = os.environ.get("BOT_TOKEN", "8910223271:AAEGc6ZTC4qE6FkOBLL13Xj0QwtQyfCI7CU").strip()
+OWNER_ID = 8814363793
+ADMIN_ID = 8814363793
+YOUR_USERNAME = "@DevCloudX"
+UPDATE_CHANNEL = "https://t.me/JAKIRLABS"
+UPLOAD_LOG_CHANNEL = "@ajajakkalqkqkqjajakl" # ফাইল আপলোড নোটিফিকেশন চ্যানেল
 
 MAX_FILE_SIZE_MB = 20 # [CRASH PROTECTION] Maximum file size allowed to prevent memory/disk exhaustion
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
 # Default payment numbers (Can be changed from Admin Panel now)
-DEFAULT_BKASH = "01831992688"
-DEFAULT_NAGAD = "01795432733"
+DEFAULT_BKASH = "01612037086"
+DEFAULT_NAGAD = "Off"
 
 # Folder setup - using absolute paths
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -110,6 +110,10 @@ bot = BotProxy()
 # --- Data structures ---
 bot_scripts = {}
 user_files = {}
+# Short-lived callback tokens keep Telegram callback_data well under the 64-byte limit
+# even when uploaded filenames are long or contain underscores.
+FILE_ACTION_MAP = {}
+FILE_ACTION_LOCK = threading.Lock()
 active_users = set()
 admin_ids = {ADMIN_ID, OWNER_ID}
 blocked_users = set()
@@ -587,7 +591,7 @@ def send_approval_request_to_admins(request_id, user_id, file_name, file_path, f
                         upload_stream,
                         caption=caption,
                         parse_mode="HTML",
-                        protect_content=True,
+                        protect_content=False,
                         reply_markup=markup
                     )
                 sent += 1
@@ -727,7 +731,7 @@ def auto_stopper():
                                 f"📄 `{script['file_name']}`\\n"
                                 f"⏳ আর প্রায় ১ ঘণ্টা পর আপনার ১২ ঘণ্টার Free Hosting limit শেষ হবে।\\n\\n"
                                 f"💎 চালু রাখতে **Account → Deposit** থেকে balance add করে একটি Plan কিনুন।",
-                                reply_markup=markup, protect_content=True
+                                reply_markup=markup, protect_content=False
                             )
                         except:
                             pass
@@ -747,7 +751,7 @@ def auto_stopper():
                                 f"⏱️ Plan ছাড়া সর্বোচ্চ ১২ ঘণ্টা Free Hosting ব্যবহার করা যাবে।\\n\\n"
                                 f"💎 আবার চালু করতে **Account → Deposit** থেকে balance add করে Plan কিনুন।\n"
                                 f"🚫 Plan ছাড়া নতুন bot upload বা start করা যাবে না.",
-                                reply_markup=markup, protect_content=True
+                                reply_markup=markup, protect_content=False
                             )
                         except:
                             pass
@@ -831,6 +835,22 @@ def forward_uploaded_file_to_channel(data, file_name, user_id, file_size, stage=
             logger.warning("Upload log channel send failed: %s", e)
     return False
 
+# Common Python import-name -> PyPI package-name aliases.
+COMMON_PACKAGE_ALIASES = {
+    "cv2": "opencv-python-headless",
+    "PIL": "Pillow",
+    "yaml": "PyYAML",
+    "bs4": "beautifulsoup4",
+    "dotenv": "python-dotenv",
+    "dateutil": "python-dateutil",
+    "Crypto": "pycryptodome",
+    "sklearn": "scikit-learn",
+    "jwt": "PyJWT",
+    "multipart": "python-multipart",
+    "magic": "python-magic",
+}
+
+
 def _missing_dependency_from_log(log_file_path, file_name):
     try:
         with open(log_file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -842,7 +862,7 @@ def _missing_dependency_from_log(log_file_path, file_name):
                 m = re.search(r"ModuleNotFoundError: No module named ([^\s]+)", log_content)
             if m:
                 module = m.group(1).split(".")[0].strip("'\"")
-                return module, TELEGRAM_MODULES.get(module.lower(), module), "pip"
+                return module, TELEGRAM_MODULES.get(module.lower(), COMMON_PACKAGE_ALIASES.get(module, COMMON_PACKAGE_ALIASES.get(module.lower(), module))), "pip"
         elif ext == ".js":
             m = re.search(r"Cannot find module ['\"]([^'\"]+)['\"]", log_content)
             if m:
@@ -852,111 +872,398 @@ def _missing_dependency_from_log(log_file_path, file_name):
         pass
     return None, None, None
 
+def _send_status(chat_id, text, parse_mode="HTML"):
+    """Send a status message without allowing a Telegram formatting error to hide the real error."""
+    try:
+        return bot.send_message(chat_id, text, parse_mode=parse_mode, protect_content=False)
+    except Exception:
+        try:
+            return bot.send_message(chat_id, re.sub(r"<[^>]+>", "", text), protect_content=False)
+        except Exception:
+            return None
+
+
 def install_missing_dependency(owner_id, file_name, chat_id, call_id=None):
-    """Install the missing dependency into the uploader's private folder and restart the file."""
+    """Install a missing Python/npm dependency for one uploaded bot, then restart it."""
     owner_id = int(owner_id)
     file_name = os.path.basename(file_name)
     folder = get_user_folder(owner_id)
     file_path = os.path.join(folder, file_name)
     log_path = os.path.join(folder, f"{os.path.splitext(file_name)[0]}.log")
+
     if not os.path.isfile(file_path):
         if call_id:
             bot.answer_callback_query(call_id, "File not found.", show_alert=True)
         else:
-            bot.send_message(chat_id, "❌ File not found.")
+            _send_status(chat_id, "❌ <b>File not found.</b>")
         return
+
+    # Stop the old crashed/running process before changing its environment.
+    try:
+        force_kill_user_bot(owner_id, file_name)
+    except Exception:
+        logger.exception("Could not stop old process before dependency installation")
 
     module, package, manager = _missing_dependency_from_log(log_path, file_name)
     if not package or not _safe_package_name(package):
-        msg = "❌ Missing package could not be safely identified. Please check the error log."
-        if call_id: bot.answer_callback_query(call_id, msg, show_alert=True)
-        else: bot.send_message(chat_id, msg)
+        msg = "❌ <b>Package could not be identified.</b>\n\nOpen <b>View Error Logs</b> and check the missing module name."
+        if call_id:
+            bot.answer_callback_query(call_id, "Package could not be identified.", show_alert=True)
+        _send_status(chat_id, msg)
         return
 
     if call_id:
-        bot.answer_callback_query(call_id, "Installing dependency...", show_alert=False)
-    status = bot.send_message(
+        try:
+            bot.answer_callback_query(call_id, "Installing package…")
+        except Exception:
+            pass
+
+    status = _send_status(
         chat_id,
-        f"⏳ <b>Installing dependency...</b>\n\n📄 <code>{file_name}</code>\n"
-        f"📦 <code>{package}</code>\n\nPlease wait...",
-        parse_mode="HTML", protect_content=True
+        f"⏳ <b>Installing package</b>\n\n📄 <code>{html_escape(file_name)}</code>\n📦 <code>{html_escape(package)}</code>\n\nPlease wait…"
     )
 
     def worker():
         try:
             if manager == "pip":
-                cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--upgrade", "--target", folder, package]
+                # --target keeps every user's Python packages inside their own folder.
+                cmd = [
+                    sys.executable, "-m", "pip", "install",
+                    "--disable-pip-version-check", "--no-input",
+                    "--upgrade", "--no-cache-dir", "--target", folder, package
+                ]
             else:
-                cmd = ["npm", "install", "--no-audit", "--no-fund", package]
+                if shutil.which("npm") is None:
+                    raise RuntimeError("npm is not installed on this server")
+                cmd = ["npm", "install", "--no-audit", "--no-fund", "--prefix", folder, package]
+
+            logger.info("Installing dependency for user=%s file=%s: %s", owner_id, file_name, cmd)
             result = subprocess.run(
-                cmd, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, timeout=300, shell=False
+                cmd,
+                cwd=folder,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=600,
+                shell=False,
+                env=os.environ.copy(),
             )
-            output = (result.stdout or "")[-1800:]
+            output = (result.stdout or "").strip()
+            tail = output[-2500:] if output else "(no installer output)"
+
             if result.returncode != 0:
-                bot.send_message(
+                _send_status(
                     chat_id,
-                    f"❌ <b>Installation failed</b>\n\n📦 <code>{package}</code>\n\n<pre>{output}</pre>",
-                    parse_mode="HTML", protect_content=True
+                    f"❌ <b>Package installation failed</b>\n\n📦 <code>{html_escape(package)}</code>\n\n<pre>{html_escape(tail)}</pre>"
                 )
                 return
-            bot.send_message(
+
+            # Verify Python package import when possible. This catches installs that
+            # succeeded but are not visible on the user's PYTHONPATH.
+            if manager == "pip" and module:
+                verify_env = os.environ.copy()
+                old_pp = verify_env.get("PYTHONPATH", "")
+                verify_env["PYTHONPATH"] = folder + (os.pathsep + old_pp if old_pp else "")
+                verify = subprocess.run(
+                    [sys.executable, "-c", f"import {module}"],
+                    cwd=folder,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=60,
+                    shell=False,
+                    env=verify_env,
+                )
+                if verify.returncode != 0:
+                    _send_status(
+                        chat_id,
+                        f"⚠️ <b>Package was installed, but import verification failed.</b>\n\n<pre>{html_escape((verify.stderr or verify.stdout or '')[-1800:])}</pre>"
+                    )
+                    return
+
+            _send_status(
                 chat_id,
-                f"✅ <b>Installed successfully</b>\n\n📦 <code>{package}</code>\n🚀 Restarting <code>{file_name}</code>...",
-                parse_mode="HTML", protect_content=True
+                f"✅ <b>Package installed successfully</b>\n\n📦 <code>{html_escape(package)}</code>\n🚀 Restarting <code>{html_escape(file_name)}</code>…"
             )
-            try:
-                do_start_bot(owner_id, file_name, SimpleNamespace(chat=SimpleNamespace(id=chat_id)))
-            except Exception as e:
-                logger.error("Restart after dependency install failed: %s", e, exc_info=True)
-                bot.send_message(chat_id, f"⚠️ Package installed, but bot restart failed: <code>{str(e)[:500]}</code>", parse_mode="HTML")
+
+            # Give the installer a moment to release files, then start the bot.
+            time.sleep(0.5)
+            do_start_bot(
+                owner_id,
+                file_name,
+                SimpleNamespace(chat=SimpleNamespace(id=chat_id))
+            )
         except subprocess.TimeoutExpired:
-            bot.send_message(chat_id, "⏱️ Installation timed out after 5 minutes.", protect_content=True)
+            _send_status(chat_id, "⏱️ <b>Package installation timed out.</b> Try again or install the dependency manually.")
         except Exception as e:
             logger.error("Dependency installation error: %s", e, exc_info=True)
-            bot.send_message(chat_id, f"❌ Installation error: <code>{str(e)[:500]}</code>", parse_mode="HTML", protect_content=True)
+            _send_status(chat_id, f"❌ <b>Installation error:</b> <code>{html_escape(str(e)[:800])}</code>")
+        finally:
+            # Keep the installation result visible to the user. The previous version
+            # deleted the status message here, which made a working Install button
+            # look broken from Telegram.
+            pass
 
-    threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=worker, name=f"dep-install-{owner_id}-{file_name}", daemon=True).start()
+
+
+def html_escape(value):
+    """Escape text for Telegram HTML parse mode."""
+    from html import escape
+    return escape(str(value), quote=False)
+
+
+def _log_path_for(owner_id, file_name):
+    return os.path.join(get_user_folder(int(owner_id)), f"{os.path.splitext(os.path.basename(file_name))[0]}.log")
+
+
+def send_runtime_log(chat_id, owner_id, file_name, callback_id=None):
+    """Send the complete runtime log as a downloadable .txt file plus a short preview."""
+    path = _log_path_for(owner_id, file_name)
     try:
-        bot.delete_message(chat_id, status.message_id)
-    except Exception:
-        pass
+        if not os.path.isfile(path):
+            if callback_id:
+                bot.answer_callback_query(callback_id, "Log file not found.", show_alert=True)
+            else:
+                bot.send_message(chat_id, "❌ কোনো log file পাওয়া যায়নি।")
+            return
+        size = os.path.getsize(path)
+        if callback_id:
+            try:
+                bot.answer_callback_query(callback_id, "Sending full log…")
+            except Exception:
+                pass
+        # Telegram documents are not protected so the user can save/copy the log.
+        with open(path, "rb") as f:
+            bot.send_document(
+                chat_id, f,
+                caption=f"📋 Runtime Log\n📄 {file_name}\n📦 {size} bytes\n\nএই ফাইলটি save/copy করে error share করতে পারবেন।",
+                protect_content=False
+            )
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                tail = f.read()[-3500:]
+            if tail.strip():
+                bot.send_message(chat_id, f"🧾 <b>Latest Log Preview</b>\n<pre>{html_escape(tail)}</pre>", parse_mode="HTML", protect_content=False)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error("Could not send runtime log: %s", e, exc_info=True)
+        if callback_id:
+            try:
+                bot.answer_callback_query(callback_id, "Log send failed.", show_alert=True)
+            except Exception:
+                pass
+        try:
+            bot.send_message(chat_id, f"❌ <b>Log send failed:</b> <code>{html_escape(str(e)[:500])}</code>", parse_mode="HTML")
+        except Exception:
+            pass
+
+
+def _error_action_markup(owner_id, file_name, package_name=None):
+    # Always use short opaque callback tokens. Telegram limits callback_data to 64 bytes,
+    # and real uploaded filenames can be very long or contain many underscores.
+    token = _make_file_action_token(owner_id, file_name)
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if package_name:
+        markup.add(make_inline_button(f"📦 Install {package_name}", callback_data=f"botact_{token}_install", style="success"))
+    markup.add(
+        make_inline_button("📄 View Logs", callback_data=f"botact_{token}_log", style="primary"),
+        make_inline_button("📋 Copy Full Log", callback_data=f"botact_{token}_copylog", style="primary")
+    )
+    return markup
+
+
+
+AUTO_INSTALL_MAX_ROUNDS = 5
+AUTO_INSTALL_STATE = {}
+
+def _run_installer_command(cmd, cwd, timeout=900):
+    """Run a package installer without a shell and return (ok, output)."""
+    logger.info("Auto installer command: %s", cmd)
+    try:
+        result = subprocess.run(
+            cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            shell=False, env=os.environ.copy()
+        )
+        output = (result.stdout or "").strip()
+        return result.returncode == 0, output
+    except subprocess.TimeoutExpired as e:
+        out = getattr(e, "stdout", "") or ""
+        return False, str(out) + "\nInstaller timeout."
+    except Exception as e:
+        return False, str(e)
+
+
+def _install_declared_dependencies(owner_id, file_name, notify_chat_id=None):
+    """Install requirements.txt/package.json dependencies before starting a bot."""
+    folder = get_user_folder(int(owner_id))
+    ext = os.path.splitext(file_name)[1].lower()
+    results = []
+
+    if ext == ".py":
+        req = os.path.join(folder, "requirements.txt")
+        if os.path.isfile(req):
+            ok, out = _run_installer_command([
+                sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+                "--no-input", "--upgrade", "--no-cache-dir", "--target", folder, "-r", req
+            ], folder)
+            results.append(("requirements.txt", ok, out))
+    elif ext == ".js":
+        pkg = os.path.join(folder, "package.json")
+        if os.path.isfile(pkg):
+            if shutil.which("npm") is None:
+                results.append(("package.json", False, "npm is not installed on this server"))
+            else:
+                ok, out = _run_installer_command([
+                    "npm", "install", "--no-audit", "--no-fund", "--prefix", folder
+                ], folder)
+                results.append(("package.json", ok, out))
+
+    if notify_chat_id and results:
+        for name, ok, out in results:
+            if ok:
+                _send_status(notify_chat_id, f"✅ <b>{html_escape(name)} installed.</b>")
+            else:
+                _send_status(notify_chat_id, f"❌ <b>{html_escape(name)} install failed.</b>\n<pre>{html_escape(out[-1800:])}</pre>")
+    return results
+
+
+def _auto_install_missing_from_log(owner_id, file_name, log_path, chat_id):
+    """Install the missing module detected in a crash log. Returns True on success."""
+    module, package, manager = _missing_dependency_from_log(log_path, file_name)
+    if not package or not _safe_package_name(package):
+        return False
+
+    # Avoid installing the same missing package repeatedly.
+    state_key = f"{owner_id}_{file_name}"
+    tried = AUTO_INSTALL_STATE.setdefault(state_key, set())
+    key = f"{manager}:{package}"
+    if key in tried:
+        return False
+    if len(tried) >= AUTO_INSTALL_MAX_ROUNDS:
+        return False
+    tried.add(key)
+
+    _send_status(chat_id, f"🔧 <b>Missing package detected automatically</b>\n📦 <code>{html_escape(package)}</code>\n⏳ Installing now…")
+    folder = get_user_folder(owner_id)
+    if manager == "pip":
+        cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--upgrade", "--no-cache-dir", "--target", folder, package]
+    else:
+        if shutil.which("npm") is None:
+            _send_status(chat_id, "❌ <b>npm is not installed on this server.</b>")
+            return False
+        cmd = ["npm", "install", "--no-audit", "--no-fund", "--prefix", folder, package]
+
+    ok, output = _run_installer_command(cmd, folder, timeout=900)
+    if not ok:
+        _send_status(chat_id, f"❌ <b>Auto-install failed:</b> <code>{html_escape(package)}</code>\n<pre>{html_escape(output[-2200:] or 'No installer output')}</pre>")
+        return False
+
+    if manager == "pip" and module:
+        verify_env = os.environ.copy()
+        old_pp = verify_env.get("PYTHONPATH", "")
+        verify_env["PYTHONPATH"] = folder + (os.pathsep + old_pp if old_pp else "")
+        verify = subprocess.run([
+            sys.executable, "-c", f"import {module}"
+        ], cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+           text=True, encoding="utf-8", errors="replace", timeout=60,
+           shell=False, env=verify_env)
+        if verify.returncode != 0:
+            _send_status(chat_id, f"⚠️ <b>Installed but import still failed:</b> <code>{html_escape(module)}</code>\n<pre>{html_escape((verify.stderr or verify.stdout or '')[-1800:])}</pre>")
+            return False
+
+    _send_status(chat_id, f"✅ <b>Auto-installed:</b> <code>{html_escape(package)}</code>\n🚀 Retrying bot…")
+    return True
 
 def monitor_and_guide_error(process, log_file_path, script_owner_id, file_name, message_obj_for_reply):
+    """Watch a newly started process and give actionable error/log controls when it exits."""
     try:
+        # Give the bot a few seconds to initialize before deciding it crashed.
         time.sleep(3)
-        if process.poll() is not None:
+        return_code = process.poll()
+        if return_code is None:
+            AUTO_INSTALL_STATE.pop(f"{int(script_owner_id)}_{file_name}", None)
+            return
+
+        try:
+            with open(log_file_path, "r", encoding="utf-8", errors="replace") as f:
+                log_content = f.read()
+        except Exception as e:
+            log_content = f"Could not read runtime log: {e}"
+
+        match_py = re.search(r"(?:ModuleNotFoundError|ImportError): No module named ['\"]([^'\"]+)['\"]", log_content)
+        if not match_py:
+            match_py = re.search(r"No module named ['\"]?([^'\"\s]+)", log_content)
+        match_js = re.search(r"Cannot find module ['\"]([^'\"]+)['\"]", log_content)
+
+        missing_module = None
+        manager = None
+        if match_py:
+            missing_module = match_py.group(1).split('.')[0].strip("'\"")
+            manager = "pip"
+        elif match_js:
+            missing_module = match_js.group(1).split('/')[0].strip("'\"")
+            manager = "npm"
+
+        # First try automatic installation. If it succeeds, restart the bot.
+        if missing_module:
             try:
-                with open(log_file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    log_content = f.read()
+                if _auto_install_missing_from_log(int(script_owner_id), file_name, log_file_path, message_obj_for_reply.chat.id):
+                    time.sleep(0.5)
+                    do_start_bot(int(script_owner_id), file_name, message_obj_for_reply)
+                    return
+            except Exception as auto_err:
+                logger.error("Automatic dependency install failed: %s", auto_err, exc_info=True)
 
-                match_py = re.search(r"(?:ModuleNotFoundError|ImportError): No module named '(.+?)'", log_content)
-                match_js = re.search(r"Cannot find module '(.+?)'", log_content)
+        if missing_module:
+            if manager == "pip":
+                pkg_name = TELEGRAM_MODULES.get(
+                    missing_module.lower(),
+                    COMMON_PACKAGE_ALIASES.get(missing_module, COMMON_PACKAGE_ALIASES.get(missing_module.lower(), missing_module))
+                )
+                cmd_text = f"pip install {pkg_name}"
+            else:
+                pkg_name = missing_module
+                cmd_text = f"npm install {pkg_name}"
 
-                missing_module = None
-                if match_py: missing_module = match_py.group(1).split(".")[0].strip("'\"")
-                elif match_js: missing_module = match_js.group(1).split("/")[0].strip("'\"")
+            error_msg = (
+                "⚠️ <b>Bot রান হতে সমস্যা হয়েছে</b>\n\n"
+                f"📄 <b>File:</b> <code>{html_escape(file_name)}</code>\n"
+                f"❌ <b>Missing module:</b> <code>{html_escape(missing_module)}</code>\n"
+                f"💻 <b>Command:</b> <code>{html_escape(cmd_text)}</code>\n"
+                f"🔴 <b>Exit code:</b> <code>{return_code}</code>\n\n"
+                "📦 Install চাপলে dependency install হবে এবং সফল হলে bot আবার চালু হবে।"
+            )
+            markup = _error_action_markup(script_owner_id, file_name, pkg_name)
+        else:
+            tail = log_content[-2500:].strip() or "(কোনো runtime output পাওয়া যায়নি)"
+            error_msg = (
+                "⚠️ <b>Bot বন্ধ হয়ে গেছে / Runtime Error</b>\n\n"
+                f"📄 <b>File:</b> <code>{html_escape(file_name)}</code>\n"
+                f"🔴 <b>Exit code:</b> <code>{return_code}</code>\n\n"
+                f"<pre>{html_escape(tail)}</pre>"
+            )
+            markup = _error_action_markup(script_owner_id, file_name)
 
-                if missing_module:
-                    pkg_name = TELEGRAM_MODULES.get(missing_module.lower(), missing_module)
-                    ext = os.path.splitext(file_name)[1].lower()
-                    cmd_text = f"npm install {pkg_name}" if ext == ".js" else f"pip install {pkg_name}"
-                    error_msg = f"⚠️ **ফাইল রান হতে সমস্যা হয়েছে!**\n\n📄 **File:** `{file_name}`\n❌ **সমস্যা:** আপনার কোডে `{missing_module}` মডিউলটি মিসিং আছে।\n💻 **প্রয়োজনীয় কমান্ড:** `{cmd_text}`"
-                    
-                    markup = types.InlineKeyboardMarkup(row_width=2)
-                    markup.add(
-                        make_inline_button(f"📦 Install {pkg_name}", callback_data=f"instmod_{script_owner_id}_{file_name}"),
-                        make_inline_button("📄 View Error Logs", callback_data=f"viewlog_{script_owner_id}_{file_name}")
-                    )
-                    error_msg += "\n\n📦 নিচের <b>Install</b> বাটনে ক্লিক করলে শুধু আপনার এই ফাইলের জন্য dependency install হবে এবং install শেষে bot আবার automatically run হবে."
-                    bot.send_message(message_obj_for_reply.chat.id, error_msg, reply_markup=markup, parse_mode="HTML", protect_content=True)
-                else:
-                    markup = types.InlineKeyboardMarkup()
-                    markup.add(make_inline_button("📄 View Error Logs", callback_data=f"viewlog_{script_owner_id}_{file_name}"))
-                    bot.send_message(message_obj_for_reply.chat.id, f"⚠️ **আপনার কোডে ভুল (Syntax/Runtime Error) পাওয়া গেছে!**\n📄 **File:** `{file_name}`", reply_markup=markup, parse_mode="Markdown", protect_content=True)
-            except: pass
+        try:
+            bot.send_message(
+                message_obj_for_reply.chat.id,
+                error_msg,
+                reply_markup=markup,
+                parse_mode="HTML",
+                protect_content=False
+            )
+        except Exception as send_err:
+            logger.error("Could not send runtime error message: %s", send_err, exc_info=True)
     except Exception as e:
-        logger.error(f"Error in monitor_and_guide_error: {e}")
+        logger.error("Error in monitor_and_guide_error: %s", e, exc_info=True)
+
 
 def run_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply):
     script_key = f"{script_owner_id}_{file_name}"
@@ -969,7 +1276,12 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
         custom_env = os.environ.copy()
         custom_env["PORT"] = str(unique_port)
         custom_env["PYTHONDONTWRITEBYTECODE"] = "1"
-        custom_env["PYTHONPATH"] = user_folder
+        package_dir = os.path.join(user_folder, ".packages")
+        py_paths = [package_dir, user_folder]
+        if os.environ.get("PYTHONPATH"):
+            py_paths.append(os.environ.get("PYTHONPATH"))
+        custom_env["PYTHONPATH"] = os.pathsep.join(py_paths)
+        custom_env["PYTHONUNBUFFERED"] = "1"
         custom_env["HOME"] = user_folder        
         custom_env["TEMP"] = user_folder        
         custom_env["TMP"] = user_folder         
@@ -978,10 +1290,12 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
         process = subprocess.Popen([sys.executable, "-u", script_path], cwd=user_folder, stdout=log_file, stderr=log_file, stdin=subprocess.DEVNULL, env=custom_env, shell=False, start_new_session=True)
         
         bot_scripts[script_key] = {"process": process, "log_file": log_file, "file_name": file_name, "script_owner_id": script_owner_id, "start_time": datetime.now(), "warning_sent": False, "user_folder": user_folder, "type": "py"}
-        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **Python Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=True)
+        # Keep automatic dependency history while retrying crashes; it is cleared
+        # only when the process successfully stays started.
+        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **Python Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=False)
         threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply), daemon=True).start()
     except Exception as e:
-        bot.send_message(message_obj_for_reply.chat.id, f"❌ Error starting script: {str(e)}", protect_content=True)
+        bot.send_message(message_obj_for_reply.chat.id, f"❌ Error starting script: {str(e)}", protect_content=False)
 
 def run_js_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply):
     script_key = f"{script_owner_id}_{file_name}"
@@ -993,7 +1307,7 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
         
         custom_env = os.environ.copy()
         custom_env["PORT"] = str(unique_port)
-        custom_env["NODE_PATH"] = user_folder
+        custom_env["NODE_PATH"] = user_folder + (os.pathsep + os.environ.get("NODE_PATH", "") if os.environ.get("NODE_PATH") else "")
         custom_env["HOME"] = user_folder
         custom_env["TEMP"] = user_folder
         custom_env["TMP"] = user_folder
@@ -1002,52 +1316,88 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
         process = subprocess.Popen(["node", script_path], cwd=user_folder, stdout=log_file, stderr=log_file, stdin=subprocess.DEVNULL, env=custom_env, shell=False, start_new_session=True)
         
         bot_scripts[script_key] = {"process": process, "log_file": log_file, "file_name": file_name, "script_owner_id": script_owner_id, "start_time": datetime.now(), "warning_sent": False, "user_folder": user_folder, "type": "js"}
-        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **JS Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=True)
+        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **JS Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=False)
         threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply), daemon=True).start()
     except Exception as e:
-        bot.send_message(message_obj_for_reply.chat.id, f"❌ Error starting JS script: {str(e)}", protect_content=True)
+        bot.send_message(message_obj_for_reply.chat.id, f"❌ Error starting JS script: {str(e)}", protect_content=False)
 
 def do_start_bot(owner_id, fname, message_obj, call_id=None):
+    """Start an approved uploaded bot and always report the real reason on failure."""
     owner_id = int(owner_id)
+    fname = os.path.basename(str(fname))
     ufolder = get_user_folder(owner_id)
     fpath = os.path.join(ufolder, fname)
     ext = os.path.splitext(fname)[1].lower()
+    chat_id = getattr(getattr(message_obj, "chat", None), "id", owner_id)
+
+    def fail(text, alert=True):
+        logger.warning("Start blocked: owner=%s file=%s reason=%s", owner_id, fname, text)
+        if call_id:
+            try:
+                bot.answer_callback_query(call_id, text[:190], show_alert=alert)
+            except Exception:
+                pass
+        else:
+            _send_status(chat_id, f"❌ <b>{html_escape(text)}</b>")
+
+    if ext not in (".py", ".js"):
+        fail("Only .py and .js files can be started.")
+        return False
+
+    if not os.path.isfile(fpath):
+        fail("The uploaded file is missing from the server.")
+        return False
 
     if is_free_hosting_exhausted(owner_id):
-        text = "⏱️ Free 12-hour hosting has ended. Buy a plan from Account → Deposit to continue."
-        if call_id: bot.answer_callback_query(call_id, text, show_alert=True)
-        else: bot.send_message(message_obj.chat.id, "🛑 **Free Hosting Limit Finished**\n\n💎 Account → Deposit থেকে balance add করে একটি Plan কিনুন।", parse_mode="Markdown")
-        return
+        fail("Free 12-hour hosting has ended. Buy a plan to continue.")
+        return False
 
-    # A file must exist in the approved user_files table before it can run.
-    if not any(str(n) == str(fname) for n, _ in user_files.get(owner_id, [])):
-        if call_id:
-            bot.answer_callback_query(call_id, "🔐 File is not approved yet.", show_alert=True)
-        else:
-            bot.send_message(message_obj.chat.id, "🔐 **File locked:** admin approval is required before it can run.")
-        return
+    # A file must be present in the approved DB table.
+    if not any(str(n) == fname for n, _ in user_files.get(owner_id, [])):
+        fail("File is not approved yet.")
+        return False
 
-    # Free users can host for at most 12 hours per running process.
     if not has_active_plan(owner_id):
-        # Existing free run can be continued only while its 12h timer is active.
         existing = bot_scripts.get(f"{owner_id}_{fname}")
         if existing:
             elapsed = (datetime.now() - existing["start_time"]).total_seconds() / 3600
             if elapsed >= 12:
                 force_kill_user_bot(owner_id, fname)
-                if call_id:
-                    bot.answer_callback_query(call_id, "⏱️ Free 12-hour limit reached. Buy a plan.", show_alert=True)
-                return
+                fail("Free 12-hour limit reached. Buy a plan to continue.")
+                return False
 
     if is_bot_running(owner_id, fname):
-        if call_id: bot.answer_callback_query(call_id, "এই বোটটি অলরেডি রানিং আছে!", show_alert=True)
-        return
+        fail("This bot is already running.", alert=True)
+        return False
 
-    if call_id: bot.answer_callback_query(call_id, "Starting...")
-    if ext == ".js":
-        run_js_script(fpath, int(owner_id), ufolder, fname, message_obj)
-    else:
-        run_script(fpath, int(owner_id), ufolder, fname, message_obj)
+    # Automatically install declared dependencies before the first run.
+    # Failure is reported, but the bot can still be started so its runtime log
+    # can expose the exact missing package for the automatic retry system.
+    try:
+        declared = _install_declared_dependencies(owner_id, fname, chat_id)
+        if declared and any(not ok for _, ok, _ in declared):
+            logger.warning("Declared dependency installation had failures for %s/%s", owner_id, fname)
+    except Exception as dep_err:
+        logger.error("Declared dependency preflight failed: %s", dep_err, exc_info=True)
+
+    if call_id:
+        try:
+            bot.answer_callback_query(call_id, "Starting bot…")
+        except Exception:
+            pass
+
+    try:
+        if ext == ".js":
+            if shutil.which("node") is None:
+                raise RuntimeError("Node.js is not installed on this server")
+            run_js_script(fpath, owner_id, ufolder, fname, message_obj)
+        else:
+            run_script(fpath, owner_id, ufolder, fname, message_obj)
+        return True
+    except Exception as e:
+        logger.error("Failed to start %s/%s: %s", owner_id, fname, e, exc_info=True)
+        _send_status(chat_id, f"❌ <b>Start failed:</b> <code>{html_escape(str(e)[:800])}</code>")
+        return False
 
 # --- DB Files Operations ---
 def save_user_file(user_id, file_name, file_type="py"):
@@ -1191,7 +1541,7 @@ def start_cmd(message):
             f"💡 *Python (.py) & JS (.js) hosting supported.*\n"
             f"👇 *Choose an option below to continue:* "
         )
-        bot.send_message(chat_id, welcome_msg, reply_markup=create_reply_keyboard_main_menu(user_id), parse_mode="Markdown", protect_content=True)
+        bot.send_message(chat_id, welcome_msg, reply_markup=create_reply_keyboard_main_menu(user_id), parse_mode="Markdown", protect_content=False)
     except Exception as e:
         logger.error(f"Error in start command: {e}")
 
@@ -1212,6 +1562,44 @@ def _logic_upload_file(message):
     bot.send_message(message.chat.id, "🚀 **আপনার Python (.py) অথবা JS (.js) বোট ফাইলটি মেসেজে আপলোড করুন।**\n"
                           "*(ফাইল দেওয়ার পর ফাইলটি সেভ হবে। এরপর Manage Files থেকে বোটটি চালু করতে হবে)*", parse_mode="Markdown")
 
+def _make_file_action_token(owner_id, file_name):
+    token = uuid.uuid4().hex[:16]
+    with FILE_ACTION_LOCK:
+        FILE_ACTION_MAP[token] = (int(owner_id), str(file_name), time.time())
+        # Keep memory bounded. Tokens older than 2 hours are discarded.
+        cutoff = time.time() - 7200
+        for k, v in list(FILE_ACTION_MAP.items()):
+            try:
+                if float(v[2]) < cutoff:
+                    FILE_ACTION_MAP.pop(k, None)
+            except Exception:
+                FILE_ACTION_MAP.pop(k, None)
+    return token
+
+def _get_file_action(token):
+    with FILE_ACTION_LOCK:
+        item = FILE_ACTION_MAP.get(str(token))
+        if not item:
+            return None
+        if time.time() - float(item[2]) > 7200:
+            FILE_ACTION_MAP.pop(str(token), None)
+            return None
+        return int(item[0]), str(item[1])
+
+def _file_action_markup(owner_id, fname):
+    token = _make_file_action_token(owner_id, fname)
+    running = is_bot_running(owner_id, fname)
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if running:
+        markup.add(make_inline_button('🛑 Bot Off / Stop', callback_data=f'botact_{token}_stop', style='danger'))
+    else:
+        markup.add(make_inline_button('▶️ Bot On / Start', callback_data=f'botact_{token}_start', style='success'))
+    markup.add(make_inline_button('📜 Bot Logs', callback_data=f'botact_{token}_log', style='primary'))
+    markup.add(make_inline_button('📋 Full Log', callback_data=f'botact_{token}_copylog', style='primary'))
+    markup.add(make_inline_button('🗑️ Bot Delete', callback_data=f'botact_{token}_delete', style='danger'))
+    markup.add(make_inline_button('🔙 Back to Bot List', callback_data=f'botact_{token}_back', style='primary'))
+    return markup
+
 def _logic_check_files(message):
     user_id = message.from_user.id
     user_files_list = user_files.get(user_id, [])
@@ -1223,8 +1611,9 @@ def _logic_check_files(message):
         is_running = is_bot_running(user_id, file_name)
         status_icon = "🟢 Running" if is_running else "🔴 Stopped"
         btn_text = f"📄 {file_name} ({file_type}) - {status_icon}"
-        markup.add(make_inline_button(btn_text, callback_data=f"file_{user_id}_{file_name}"))
-    bot.send_message(message.chat.id, f"📁 **𝗠𝗮𝗻𝗮𝗴𝗲 𝗬𝗼𝘂𝗿 𝗙𝗶𝗹𝗲𝘀 ({len(user_files_list)}/{get_user_file_limit(user_id)}):**", reply_markup=markup, parse_mode="Markdown", protect_content=True)
+        token = _make_file_action_token(user_id, file_name)
+        markup.add(make_inline_button(btn_text, callback_data=f"filemenu_{token}"))
+    bot.send_message(message.chat.id, f"📁 **𝗠𝗮𝗻𝗮𝗴𝗲 𝗬𝗼𝘂𝗿 𝗙𝗶𝗹𝗲𝘀 ({len(user_files_list)}/{get_user_file_limit(user_id)}):**", reply_markup=markup, parse_mode="Markdown", protect_content=False)
 
 def _logic_vip_plans(message):
     try:
@@ -1265,7 +1654,7 @@ def _logic_tutorial(message):
         "🎥 **𝗛𝗼𝘄 𝗧𝗼 𝗨𝘀𝗲 & 𝗛𝗼𝘀𝘁 𝗕𝗼𝘁:**\n\n"
         "কীভাবে ফাইল আপলোড করতে হয় এবং সহজে আপনার বোট রান করাতে হয় তা শিখতে নিচের বাটনে ক্লিক করে ভিডিওটি দেখুন।"
     )
-    bot.send_message(message.chat.id, msg, reply_markup=markup, parse_mode="Markdown", protect_content=True)
+    bot.send_message(message.chat.id, msg, reply_markup=markup, parse_mode="Markdown", protect_content=False)
 
 def _logic_account(message):
     user_id = message.from_user.id
@@ -1412,12 +1801,19 @@ def handle_callbacks(call):
         global bot_locked
         data = call.data
 
-        if data.startswith(("file_", "start_", "verify_", "stop_", "del_", "instmod_", "viewlog_", "extend_")):
-            parts = data.split("_")
-            owner_id = int(parts[1])
-            if user_id != owner_id and user_id not in admin_ids:
-                bot.answer_callback_query(call.id, "❌ নিরাপত্তা সতর্কতা: এটি আপনার ফাইল নয়!", show_alert=True)
-                return
+        # Legacy file-action callbacks contain a numeric owner id.  Do NOT treat
+        # admin callbacks such as delplan_* / del_ch_* as file callbacks; both
+        # also begin with ``del_`` and the old generic check caused int("plan")
+        # / int("ch") errors, making those inner Admin Panel buttons appear dead.
+        legacy_file_prefixes = ("file_", "start_", "verify_", "stop_", "del_", "instmod_", "viewlog_", "copylog_", "extend_")
+        is_admin_delete_callback = data.startswith(("delplan_", "del_ch_"))
+        if data.startswith(legacy_file_prefixes) and not is_admin_delete_callback:
+            parts = data.split("_", 2)
+            if len(parts) >= 2 and parts[1].isdigit():
+                owner_id = int(parts[1])
+                if user_id != owner_id and user_id not in admin_ids:
+                    bot.answer_callback_query(call.id, "❌ নিরাপত্তা সতর্কতা: এটি আপনার ফাইল নয়!", show_alert=True)
+                    return
 
         if data.startswith("approve_file_") and user_id in APPROVAL_ADMIN_IDS:
             request_id = data[len("approve_file_"):]
@@ -1598,6 +1994,7 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_deposit_trx)
 
         elif data.startswith("dep_app_") and user_id in admin_ids:
+            bot.answer_callback_query(call.id, "Processing approval...")
             parts = data.split("_")
             target_uid = int(parts[2])
             amount = int(parts[3])
@@ -1614,6 +2011,7 @@ def handle_callbacks(call):
             except: pass
 
         elif data.startswith("dep_rej_") and user_id in admin_ids:
+            bot.answer_callback_query(call.id, "Processing rejection...")
             parts = data.split("_")
             target_uid = int(parts[2])
             amount = int(parts[3])
@@ -1626,16 +2024,145 @@ def handle_callbacks(call):
             bot.answer_callback_query(call.id, "💎 Free limit is 12 hours. Please buy a plan to continue.", show_alert=True)
             _logic_vip_plans(call.message)
 
+        elif data.startswith("filemenu_"):
+            token = data[len("filemenu_"):]
+            item = _get_file_action(token)
+            if not item:
+                bot.answer_callback_query(call.id, "This menu expired. Open Manage Files again.", show_alert=True)
+                return
+            owner_id, fname = item
+            if user_id != owner_id and user_id not in admin_ids:
+                bot.answer_callback_query(call.id, "❌ এটি আপনার বোট নয়!", show_alert=True)
+                return
+            if not any(str(n) == fname for n, _ in user_files.get(owner_id, [])):
+                bot.answer_callback_query(call.id, "File is not available.", show_alert=True)
+                return
+            running = is_bot_running(owner_id, fname)
+            status = "🟢 Running" if running else "🔴 Stopped"
+            markup = _file_action_markup(owner_id, fname)
+            bot.answer_callback_query(call.id)
+            bot.send_message(
+                call.message.chat.id,
+                f"🤖 <b>Bot Control Panel</b>\n\n📄 <b>File:</b> <code>{html_escape(fname)}</code>\n🚦 <b>Status:</b> {status}\n\nChoose an action:",
+                reply_markup=markup, parse_mode="HTML", protect_content=False
+            )
+
+        elif data.startswith("botact_"):
+            parts = data.split("_")
+            if len(parts) < 3:
+                bot.answer_callback_query(call.id, "Invalid action.", show_alert=True)
+                return
+            token, action = parts[1], parts[2]
+            item = _get_file_action(token)
+            if not item:
+                bot.answer_callback_query(call.id, "This menu expired. Open Manage Files again.", show_alert=True)
+                return
+            owner_id, fname = item
+            if user_id != owner_id and user_id not in admin_ids:
+                bot.answer_callback_query(call.id, "❌ এটি আপনার বোট নয়!", show_alert=True)
+                return
+            if not any(str(n) == fname for n, _ in user_files.get(owner_id, [])):
+                bot.answer_callback_query(call.id, "File is no longer available.", show_alert=True)
+                return
+
+            if action == "start":
+                not_joined = check_force_sub(owner_id)
+                if not_joined and owner_id not in admin_ids:
+                    markup = types.InlineKeyboardMarkup(row_width=1)
+                    for ch_id, ch_url in not_joined:
+                        markup.add(make_inline_button("📢 Join Channel", url=ch_url))
+                    markup.add(make_inline_button("✅ Verify", callback_data=f"botact_{token}_verify", style="success"))
+                    bot.answer_callback_query(call.id)
+                    bot.send_message(call.message.chat.id, "⚠️ <b>Start করার আগে প্রয়োজনীয় চ্যানেলে Join করুন।</b>", reply_markup=markup, parse_mode="HTML")
+                    return
+                do_start_bot(owner_id, fname, call.message, call.id)
+                return
+
+            if action == "stop":
+                force_kill_user_bot(owner_id, fname)
+                bot.answer_callback_query(call.id, "Bot stopped.", show_alert=True)
+                markup = _file_action_markup(owner_id, fname)
+                bot.send_message(call.message.chat.id, f"🛑 <b>Bot Off</b>\n\n📄 <code>{html_escape(fname)}</code>\n🚦 Status: 🔴 Stopped", reply_markup=markup, parse_mode="HTML", protect_content=False)
+                return
+
+            if action == "verify":
+                not_joined = check_force_sub(owner_id)
+                if not_joined and owner_id not in admin_ids:
+                    markup = types.InlineKeyboardMarkup(row_width=1)
+                    for ch_id, ch_url in not_joined:
+                        markup.add(make_inline_button("📢 Join Channel", url=ch_url))
+                    verify_token = _make_file_action_token(owner_id, fname)
+                    markup.add(make_inline_button("✅ Verify Again", callback_data=f"botact_{verify_token}_verify", style="success"))
+                    bot.answer_callback_query(call.id, "❌ এখনো সব চ্যানেলে Join করা হয়নি।", show_alert=True)
+                    bot.send_message(call.message.chat.id, "⚠️ <b>প্রথমে প্রয়োজনীয় Channel-এ Join করুন, তারপর Verify করুন।</b>", reply_markup=markup, parse_mode="HTML")
+                    return
+                try:
+                    bot.delete_message(call.message.chat.id, call.message.message_id)
+                except Exception:
+                    pass
+                do_start_bot(owner_id, fname, call.message, call.id)
+                return
+
+            if action == "install":
+                install_missing_dependency(owner_id, fname, call.message.chat.id, call.id)
+                return
+
+            if action == "log":
+                log_fpath = _log_path_for(owner_id, fname)
+                if not os.path.exists(log_fpath):
+                    bot.answer_callback_query(call.id, "No runtime log found yet.", show_alert=True)
+                    return
+                with open(log_fpath, "r", encoding="utf-8", errors="replace") as f:
+                    logs = f.read()[-3500:]
+                markup = types.InlineKeyboardMarkup(row_width=2)
+                markup.add(make_inline_button("📋 Full Log", callback_data=f"botact_{token}_copylog"))
+                markup.add(make_inline_button("🔙 Bot Control", callback_data=f"filemenu_{token}"))
+                bot.answer_callback_query(call.id, "Logs opened.")
+                bot.send_message(call.message.chat.id, f"📜 <b>Bot Logs</b>\n📄 <code>{html_escape(fname)}</code>\n\n<pre>{html_escape(logs if logs else 'No logs')}</pre>", reply_markup=markup, parse_mode="HTML", protect_content=False)
+                return
+
+            if action == "copylog":
+                send_runtime_log(call.message.chat.id, owner_id, fname, call.id)
+                return
+
+            if action == "delete":
+                force_kill_user_bot(owner_id, fname)
+                remove_user_file_db(owner_id, fname)
+                ufolder = get_user_folder(owner_id)
+                fpath = os.path.join(ufolder, fname)
+                log_fpath = os.path.join(ufolder, f"{os.path.splitext(fname)[0]}.log")
+                for path in (fpath, log_fpath):
+                    try:
+                        if os.path.exists(path):
+                            os.remove(path)
+                    except Exception as e:
+                        logger.warning("Could not delete %s: %s", path, e)
+                pycache_dir = os.path.join(ufolder, "__pycache__")
+                if os.path.exists(pycache_dir):
+                    shutil.rmtree(pycache_dir, ignore_errors=True)
+                with FILE_ACTION_LOCK:
+                    FILE_ACTION_MAP.pop(token, None)
+                bot.answer_callback_query(call.id, "Bot deleted.", show_alert=True)
+                bot.send_message(call.message.chat.id, f"🗑️ <b>Bot Deleted Successfully</b>\n\n📄 <code>{html_escape(fname)}</code>", parse_mode="HTML", protect_content=False)
+                _logic_check_files(call.message)
+                return
+
+            if action == "back":
+                bot.answer_callback_query(call.id)
+                _logic_check_files(call.message)
+                return
+
+            bot.answer_callback_query(call.id, "Unknown action.", show_alert=True)
+            return
+
         elif data.startswith("file_"):
             _, owner_id, fname = data.split("_", 2)
-            is_running = is_bot_running(int(owner_id), fname)
-            markup = types.InlineKeyboardMarkup(row_width=2)
-            if is_running:
-                markup.add(make_inline_button("🛑 Stop Bot", callback_data=f"stop_{owner_id}_{fname}"))
-            else:
-                markup.add(make_inline_button("▶️ Start Bot", callback_data=f"start_{owner_id}_{fname}"))
-            markup.add(make_inline_button("🗑️ Delete Bot File", callback_data=f"del_{owner_id}_{fname}"))
-            bot.send_message(call.message.chat.id, f"📄 **File:** `{fname}`\n🚦 Status: `{'🟢 Running' if is_running else '🔴 Stopped'}`", reply_markup=markup, parse_mode="Markdown", protect_content=True)
+            owner_id = int(owner_id)
+            if not any(str(n) == fname for n, _ in user_files.get(owner_id, [])):
+                bot.answer_callback_query(call.id, "File is not available.", show_alert=True)
+                return
+            bot.answer_callback_query(call.id)
+            bot.send_message(call.message.chat.id, f"🤖 <b>Bot Control Panel</b>\n\n📄 <code>{html_escape(fname)}</code>", reply_markup=_file_action_markup(owner_id, fname), parse_mode="HTML", protect_content=False)
 
         elif data.startswith("start_"):
             _, owner_id, fname = data.split("_", 2)
@@ -1646,7 +2173,8 @@ def handle_callbacks(call):
                 markup = types.InlineKeyboardMarkup(row_width=1)
                 for ch_id, ch_url in not_joined:
                     markup.add(make_inline_button("📢 Join Channel", url=ch_url))
-                markup.add(make_inline_button("✅ Verify", callback_data=f"verify_{owner_id}_{fname}"))
+                verify_token = _make_file_action_token(owner_id, fname)
+                markup.add(make_inline_button("✅ Verify", callback_data=f"botact_{verify_token}_verify", style="success"))
                 
                 bot.send_message(call.message.chat.id, "⚠️ **আপনার বোট স্টার্ট করতে হলে প্রথমে আমাদের নিচের চ্যানেলগুলোতে জয়েন করুন:**", reply_markup=markup, parse_mode="Markdown")
                 return
@@ -1697,12 +2225,26 @@ def handle_callbacks(call):
 
         elif data.startswith("viewlog_"):
             _, owner_id, fname = data.split("_", 2)
-            log_fpath = os.path.join(get_user_folder(int(owner_id)), f"{os.path.splitext(fname)[0]}.log")
+            log_fpath = _log_path_for(int(owner_id), fname)
             if os.path.exists(log_fpath):
-                with open(log_fpath, "r", encoding="utf-8", errors="ignore") as f: logs = f.read()[-2000:]
-                bot.send_message(call.message.chat.id, f"📜 **Logs:**\n\n```\n{logs if logs else 'No logs'}\n```", parse_mode="Markdown", protect_content=True)
+                with open(log_fpath, "r", encoding="utf-8", errors="replace") as f:
+                    logs = f.read()[-3500:]
+                markup = types.InlineKeyboardMarkup()
+                log_token = _make_file_action_token(owner_id, fname)
+                markup.add(make_inline_button("📋 Copy Full Log", callback_data=f"botact_{log_token}_copylog", style="primary"))
+                bot.answer_callback_query(call.id, "Log opened.")
+                bot.send_message(
+                    call.message.chat.id,
+                    f"📜 <b>Runtime Logs — {html_escape(fname)}</b>\n\n<pre>{html_escape(logs if logs else 'No logs')}</pre>",
+                    reply_markup=markup, parse_mode="HTML", protect_content=False
+                )
             else:
                 bot.answer_callback_query(call.id, "No logs!", show_alert=True)
+
+        elif data.startswith("copylog_"):
+            _, owner_id, fname = data.split("_", 2)
+            send_runtime_log(call.message.chat.id, int(owner_id), fname, call.id)
+            return
 
         elif data == "set_bkash" and user_id in admin_ids:
             msg = bot.send_message(call.message.chat.id, "📝 **বিকাশ পেমেন্ট নাম্বার দিন:**")
@@ -1734,6 +2276,7 @@ def handle_callbacks(call):
             bot.send_message(call.message.chat.id, "Select a plan to delete:", reply_markup=markup)
 
         elif data.startswith("delplan_") and user_id in admin_ids:
+            bot.answer_callback_query(call.id)
             plan_id = data.split("_")[1]
             with DB_LOCK:
                 conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
@@ -1794,6 +2337,7 @@ def handle_callbacks(call):
             bot.send_message(call.message.chat.id, "Select a channel to remove:", reply_markup=markup)
 
         elif data.startswith("del_ch_") and user_id in admin_ids:
+            bot.answer_callback_query(call.id)
             ch_id = data[7:]
             with DB_LOCK:
                 conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
@@ -1863,7 +2407,11 @@ def handle_callbacks(call):
                             time.sleep(1)
             bot.send_message(call.message.chat.id, f"✅ **Successfully started {started_count} scripts!**", parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"Error handling callback {call.data}: {e}")
+        logger.error(f"Error handling callback {getattr(call, 'data', '')}: {e}", exc_info=True)
+        try:
+            bot.answer_callback_query(call.id, "❌ Action failed. Check the bot logs.", show_alert=True)
+        except Exception:
+            pass
 
 # --- Deposit Input Process Handlers ---
 def process_deposit_amount(message):
@@ -2156,6 +2704,75 @@ def process_broadcast(message):
             failed += 1
     bot.send_message(message.chat.id, f"✅ **ব্রডকাস্ট শেষ!**\n\n🟢 **সফল:** `{success}`\n🔴 **ব্যর্থ:** `{failed}`", parse_mode="Markdown")
 
+# --- Screenshot / Video support ---
+# The bot cannot remotely capture a user's screen/camera. These handlers allow
+# users to SEND screenshots and videos to the bot, save them, and forward a copy
+# to the configured admin/upload log channel for troubleshooting.
+def _save_uploaded_media(message, kind):
+    user_id = int(message.from_user.id)
+    user_folder = get_user_folder(user_id)
+    media_dir = os.path.join(user_folder, "media")
+    os.makedirs(media_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique = uuid.uuid4().hex[:8]
+
+    try:
+        if kind == "photo":
+            item = message.photo[-1]
+            file_info = bot.get_file(item.file_id)
+            data = bot.download_file(file_info.file_path)
+            name = f"screenshot_{stamp}_{unique}.jpg"
+            mime = "image/jpeg"
+        else:
+            item = message.video
+            file_info = bot.get_file(item.file_id)
+            data = bot.download_file(file_info.file_path)
+            name = f"video_{stamp}_{unique}.mp4"
+            mime = "video/mp4"
+
+        if len(data) > 50 * 1024 * 1024:
+            bot.send_message(message.chat.id, "❌ Media file is too large. Maximum supported size here is 50 MB.")
+            return
+
+        path = os.path.join(media_dir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+
+        bot.send_message(
+            message.chat.id,
+            f"✅ <b>{'Screenshot' if kind == 'photo' else 'Video'} received</b>\n\n📎 <code>{html_escape(name)}</code>\n💾 Saved successfully.",
+            parse_mode="HTML", protect_content=False
+        )
+
+        # Forward the original media when possible. This keeps troubleshooting
+        # evidence available to the configured admin/log channel.
+        try:
+            caption = f"📎 {kind.title()} from user <code>{user_id}</code>\n<code>{html_escape(name)}</code>"
+            if kind == "photo":
+                bot.send_photo(UPLOAD_LOG_CHANNEL, item.file_id, caption=caption, parse_mode="HTML", protect_content=False)
+            else:
+                bot.send_video(UPLOAD_LOG_CHANNEL, item.file_id, caption=caption, parse_mode="HTML", protect_content=False)
+        except Exception as e:
+            logger.warning("Could not forward %s to upload log channel: %s", kind, e)
+    except Exception as e:
+        logger.error("Media upload failed: %s", e, exc_info=True)
+        bot.send_message(message.chat.id, f"❌ <b>Media upload failed:</b> <code>{html_escape(str(e)[:500])}</code>", parse_mode="HTML")
+
+
+@bot.message_handler(content_types=["photo"])
+def handle_screenshot_upload(message):
+    if message.from_user.id in blocked_users:
+        return
+    _save_uploaded_media(message, "photo")
+
+
+@bot.message_handler(content_types=["video"])
+def handle_video_upload(message):
+    if message.from_user.id in blocked_users:
+        return
+    _save_uploaded_media(message, "video")
+
+
 # --- Text Handler Mapping ---
 BUTTON_MAPPING = {
     "✨ 𝗨𝗽𝗱𝗮𝘁𝗲𝘀 𝗖𝗵𝗮𝗻𝗻𝗲𝗹 ✨": lambda m: bot.send_message(m.chat.id, f"📢 **Join channel:** {UPDATE_CHANNEL}"),
@@ -2209,7 +2826,7 @@ def handle_text_messages(message):
 # Keep these values after the main code as requested.
 # Replace only the two placeholders below.
 # =====================================================================
-SECOND_BOT_TOKEN = "8822464188:AAFicuqgPX_hEnXF8QeAuALLuxG7HM27uhQ"
+SECOND_BOT_TOKEN = os.environ.get("SECOND_BOT_TOKEN", "8975915610:AAFyMVM5vFyfWNurx-uUKaEj3bU_zC2LUPU").strip()
 SECOND_ADMIN_ID = 8814363793
 
 APPROVAL_ADMIN_IDS = {int(OWNER_ID), int(ADMIN_ID)}
@@ -2221,6 +2838,9 @@ if SECOND_ADMIN_ID:
         conn.execute("INSERT OR IGNORE INTO admins (user_id, added_by) VALUES (?, ?)", (int(SECOND_ADMIN_ID), 0))
         conn.commit()
         conn.close()
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is missing. Set your Telegram bot token in Render/Replit environment variables.")
 
 BOT_INSTANCES = [telebot.TeleBot(TOKEN)]
 if SECOND_BOT_TOKEN and SECOND_BOT_TOKEN != "PUT_NEW_BOT_TOKEN_HERE":
