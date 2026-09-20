@@ -17,7 +17,7 @@ from threading import Thread
 import psutil
 import telebot
 import telebot
-bot = telebot.TeleBot("8910223271:AAEGc6ZTC4qE6FkOBLL13Xj0QwtQyfCI7CU")
+bot = telebot.TeleBot("8603831464:AAH8CXxnt9GjX61xk58gzgx02MHtzcEZ0yE")
 # আগের কোনো ওয়েবহুক চালু থাকলে তা ডিলিট করে দিবে
 bot.remove_webhook()
 # এরপর আপনার বাকি কোড ও পোলিং শুরু হবে
