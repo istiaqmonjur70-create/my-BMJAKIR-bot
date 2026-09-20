@@ -1799,7 +1799,19 @@ def handle_callbacks(call):
             return
             
         global bot_locked
-        data = call.data
+        data = str(call.data or "")
+        callback_answered = False
+
+        def answer_once(text="", show_alert=False):
+            nonlocal callback_answered
+            if callback_answered:
+                return
+            try:
+                bot.answer_callback_query(call.id, text, show_alert=show_alert)
+                callback_answered = True
+            except Exception as e:
+                logger.warning("Callback answer failed for %s: %s", data, e)
+
 
         # Legacy file-action callbacks contain a numeric owner id.  Do NOT treat
         # admin callbacks such as delplan_* / del_ch_* as file callbacks; both
@@ -1812,21 +1824,21 @@ def handle_callbacks(call):
             if len(parts) >= 2 and parts[1].isdigit():
                 owner_id = int(parts[1])
                 if user_id != owner_id and user_id not in admin_ids:
-                    bot.answer_callback_query(call.id, "❌ নিরাপত্তা সতর্কতা: এটি আপনার ফাইল নয়!", show_alert=True)
+                    answer_once( "❌ নিরাপত্তা সতর্কতা: এটি আপনার ফাইল নয়!", show_alert=True)
                     return
 
         if data.startswith("approve_file_") and user_id in APPROVAL_ADMIN_IDS:
             request_id = data[len("approve_file_"):]
             result = finalize_approved_upload(request_id, user_id)
             if not result:
-                bot.answer_callback_query(call.id, "Already processed or request not found.", show_alert=True)
+                answer_once( "Already processed or request not found.", show_alert=True)
                 return
             if result[0] in ("missing", "error"):
-                bot.answer_callback_query(call.id, "Approval failed.", show_alert=True)
+                answer_once( "Approval failed.", show_alert=True)
                 return
 
             _, target_uid, fname, file_path, risk_note = result
-            bot.answer_callback_query(call.id, f"{get_random_button_prefix('success')} Approved", show_alert=True)
+            answer_once( f"{get_random_button_prefix('success')} Approved", show_alert=True)
             try:
                 bot.edit_message_caption(
                     f"🟢 <b>APPROVED</b>\n\n📄 <code>{fname}</code>\n👤 User: <code>{target_uid}</code>\n{risk_note}",
@@ -1867,11 +1879,11 @@ def handle_callbacks(call):
             request_id = data[len("reject_file_"):]
             result = finalize_rejected_upload(request_id, user_id)
             if not result:
-                bot.answer_callback_query(call.id, "Already processed or request not found.", show_alert=True)
+                answer_once( "Already processed or request not found.", show_alert=True)
                 return
 
             _, target_uid, fname = result
-            bot.answer_callback_query(call.id, f"{get_random_button_prefix('danger')} Rejected", show_alert=True)
+            answer_once( f"{get_random_button_prefix('danger')} Rejected", show_alert=True)
             try:
                 bot.edit_message_caption(
                     f"🔴 <b>FILE REJECTED</b>\n\n📄 <code>{fname}</code>\n👤 User: <code>{target_uid}</code>\n\n❌ Rejected successfully.",
@@ -1895,7 +1907,7 @@ def handle_callbacks(call):
             return
 
         if data == "show_vip_plans":
-            bot.answer_callback_query(call.id)
+            answer_once()
             _logic_vip_plans(call.message)
             return
 
@@ -1903,7 +1915,7 @@ def handle_callbacks(call):
             try:
                 with DB_LOCK:
                     if not os.path.exists(DATABASE_PATH):
-                        bot.answer_callback_query(call.id, "Database not found.", show_alert=True)
+                        answer_once( "Database not found.", show_alert=True)
                         return
                     with open(DATABASE_PATH, "rb") as dbf:
                         bot.send_document(
@@ -1912,10 +1924,10 @@ def handle_callbacks(call):
                             caption="🗄️ **Database Backup**\n\nComplete bot database backup.",
                             parse_mode="Markdown"
                         )
-                bot.answer_callback_query(call.id, "Database sent.", show_alert=True)
+                answer_once( "Database sent.", show_alert=True)
             except Exception as e:
                 logger.error("DB download failed: %s", e, exc_info=True)
-                bot.answer_callback_query(call.id, "Database download failed.", show_alert=True)
+                answer_once( "Database download failed.", show_alert=True)
             return
 
         if data == "db_upload" and int(user_id) == int(globals().get("SECOND_ADMIN_ID", 0) or 0):
@@ -1939,7 +1951,7 @@ def handle_callbacks(call):
                 conn.close()
             
             if not plan_row:
-                bot.answer_callback_query(call.id, "Plan not found!", show_alert=True)
+                answer_once( "Plan not found!", show_alert=True)
                 return
                 
             plan_name, duration_days, price_text = plan_row
@@ -1947,7 +1959,7 @@ def handle_callbacks(call):
             try:
                 price_num = int(''.join(filter(str.isdigit, str(price_text))))
             except ValueError:
-                bot.answer_callback_query(call.id, "Error in plan price configuration.", show_alert=True)
+                answer_once( "Error in plan price configuration.", show_alert=True)
                 return
                 
             balance, _ = get_user_account(user_id)
@@ -1962,10 +1974,10 @@ def handle_callbacks(call):
                     conn.commit()
                     conn.close()
                     
-                bot.answer_callback_query(call.id, "✅ Plan Purchased Successfully!", show_alert=True)
+                answer_once( "✅ Plan Purchased Successfully!", show_alert=True)
                 bot.send_message(call.message.chat.id, f"🎉 **অভিনন্দন!**\nআপনার **{plan_name}** প্ল্যানটি কেনা সফল হয়েছে।\nমেয়াদ: {duration_days} দিন।\nব্যালেন্স থেকে `{price_num} BDT` কাটা হয়েছে।", parse_mode="Markdown")
             else:
-                bot.answer_callback_query(call.id, "❌ অপর্যাপ্ত ব্যালেন্স!", show_alert=True)
+                answer_once( "❌ অপর্যাপ্ত ব্যালেন্স!", show_alert=True)
                 bot.send_message(call.message.chat.id, f"❌ **অপর্যাপ্ত ব্যালেন্স!**\nপ্ল্যানটির দাম `{price_num} BDT`, কিন্তু আপনার একাউন্টে আছে `{balance} BDT`। দয়া করে 👤 Account থেকে ডিপোজিট করুন।", parse_mode="Markdown")
 
         elif data == "deposit_init":
@@ -1975,7 +1987,7 @@ def handle_callbacks(call):
         elif data.startswith("dep_method_"):
             method = data.split("_")[2]
             if user_id not in temp_deposit:
-                bot.answer_callback_query(call.id, "Session expired, try again.", show_alert=True)
+                answer_once( "Session expired, try again.", show_alert=True)
                 return
             temp_deposit[user_id]["method"] = method
             
@@ -1994,7 +2006,7 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_deposit_trx)
 
         elif data.startswith("dep_app_") and user_id in admin_ids:
-            bot.answer_callback_query(call.id, "Processing approval...")
+            answer_once( "Processing approval...")
             parts = data.split("_")
             target_uid = int(parts[2])
             amount = int(parts[3])
@@ -2011,7 +2023,7 @@ def handle_callbacks(call):
             except: pass
 
         elif data.startswith("dep_rej_") and user_id in admin_ids:
-            bot.answer_callback_query(call.id, "Processing rejection...")
+            answer_once( "Processing rejection...")
             parts = data.split("_")
             target_uid = int(parts[2])
             amount = int(parts[3])
@@ -2021,26 +2033,26 @@ def handle_callbacks(call):
             except: pass
 
         elif data.startswith("extend_"):
-            bot.answer_callback_query(call.id, "💎 Free limit is 12 hours. Please buy a plan to continue.", show_alert=True)
+            answer_once( "💎 Free limit is 12 hours. Please buy a plan to continue.", show_alert=True)
             _logic_vip_plans(call.message)
 
         elif data.startswith("filemenu_"):
             token = data[len("filemenu_"):]
             item = _get_file_action(token)
             if not item:
-                bot.answer_callback_query(call.id, "This menu expired. Open Manage Files again.", show_alert=True)
+                answer_once( "This menu expired. Open Manage Files again.", show_alert=True)
                 return
             owner_id, fname = item
             if user_id != owner_id and user_id not in admin_ids:
-                bot.answer_callback_query(call.id, "❌ এটি আপনার বোট নয়!", show_alert=True)
+                answer_once( "❌ এটি আপনার বোট নয়!", show_alert=True)
                 return
             if not any(str(n) == fname for n, _ in user_files.get(owner_id, [])):
-                bot.answer_callback_query(call.id, "File is not available.", show_alert=True)
+                answer_once( "File is not available.", show_alert=True)
                 return
             running = is_bot_running(owner_id, fname)
             status = "🟢 Running" if running else "🔴 Stopped"
             markup = _file_action_markup(owner_id, fname)
-            bot.answer_callback_query(call.id)
+            answer_once()
             bot.send_message(
                 call.message.chat.id,
                 f"🤖 <b>Bot Control Panel</b>\n\n📄 <b>File:</b> <code>{html_escape(fname)}</code>\n🚦 <b>Status:</b> {status}\n\nChoose an action:",
@@ -2050,19 +2062,19 @@ def handle_callbacks(call):
         elif data.startswith("botact_"):
             parts = data.split("_")
             if len(parts) < 3:
-                bot.answer_callback_query(call.id, "Invalid action.", show_alert=True)
+                answer_once( "Invalid action.", show_alert=True)
                 return
             token, action = parts[1], parts[2]
             item = _get_file_action(token)
             if not item:
-                bot.answer_callback_query(call.id, "This menu expired. Open Manage Files again.", show_alert=True)
+                answer_once( "This menu expired. Open Manage Files again.", show_alert=True)
                 return
             owner_id, fname = item
             if user_id != owner_id and user_id not in admin_ids:
-                bot.answer_callback_query(call.id, "❌ এটি আপনার বোট নয়!", show_alert=True)
+                answer_once( "❌ এটি আপনার বোট নয়!", show_alert=True)
                 return
             if not any(str(n) == fname for n, _ in user_files.get(owner_id, [])):
-                bot.answer_callback_query(call.id, "File is no longer available.", show_alert=True)
+                answer_once( "File is no longer available.", show_alert=True)
                 return
 
             if action == "start":
@@ -2072,7 +2084,7 @@ def handle_callbacks(call):
                     for ch_id, ch_url in not_joined:
                         markup.add(make_inline_button("📢 Join Channel", url=ch_url))
                     markup.add(make_inline_button("✅ Verify", callback_data=f"botact_{token}_verify", style="success"))
-                    bot.answer_callback_query(call.id)
+                    answer_once()
                     bot.send_message(call.message.chat.id, "⚠️ <b>Start করার আগে প্রয়োজনীয় চ্যানেলে Join করুন।</b>", reply_markup=markup, parse_mode="HTML")
                     return
                 do_start_bot(owner_id, fname, call.message, call.id)
@@ -2080,7 +2092,7 @@ def handle_callbacks(call):
 
             if action == "stop":
                 force_kill_user_bot(owner_id, fname)
-                bot.answer_callback_query(call.id, "Bot stopped.", show_alert=True)
+                answer_once( "Bot stopped.", show_alert=True)
                 markup = _file_action_markup(owner_id, fname)
                 bot.send_message(call.message.chat.id, f"🛑 <b>Bot Off</b>\n\n📄 <code>{html_escape(fname)}</code>\n🚦 Status: 🔴 Stopped", reply_markup=markup, parse_mode="HTML", protect_content=False)
                 return
@@ -2093,7 +2105,7 @@ def handle_callbacks(call):
                         markup.add(make_inline_button("📢 Join Channel", url=ch_url))
                     verify_token = _make_file_action_token(owner_id, fname)
                     markup.add(make_inline_button("✅ Verify Again", callback_data=f"botact_{verify_token}_verify", style="success"))
-                    bot.answer_callback_query(call.id, "❌ এখনো সব চ্যানেলে Join করা হয়নি।", show_alert=True)
+                    answer_once( "❌ এখনো সব চ্যানেলে Join করা হয়নি।", show_alert=True)
                     bot.send_message(call.message.chat.id, "⚠️ <b>প্রথমে প্রয়োজনীয় Channel-এ Join করুন, তারপর Verify করুন।</b>", reply_markup=markup, parse_mode="HTML")
                     return
                 try:
@@ -2110,14 +2122,14 @@ def handle_callbacks(call):
             if action == "log":
                 log_fpath = _log_path_for(owner_id, fname)
                 if not os.path.exists(log_fpath):
-                    bot.answer_callback_query(call.id, "No runtime log found yet.", show_alert=True)
+                    answer_once( "No runtime log found yet.", show_alert=True)
                     return
                 with open(log_fpath, "r", encoding="utf-8", errors="replace") as f:
                     logs = f.read()[-3500:]
                 markup = types.InlineKeyboardMarkup(row_width=2)
                 markup.add(make_inline_button("📋 Full Log", callback_data=f"botact_{token}_copylog"))
                 markup.add(make_inline_button("🔙 Bot Control", callback_data=f"filemenu_{token}"))
-                bot.answer_callback_query(call.id, "Logs opened.")
+                answer_once( "Logs opened.")
                 bot.send_message(call.message.chat.id, f"📜 <b>Bot Logs</b>\n📄 <code>{html_escape(fname)}</code>\n\n<pre>{html_escape(logs if logs else 'No logs')}</pre>", reply_markup=markup, parse_mode="HTML", protect_content=False)
                 return
 
@@ -2142,26 +2154,26 @@ def handle_callbacks(call):
                     shutil.rmtree(pycache_dir, ignore_errors=True)
                 with FILE_ACTION_LOCK:
                     FILE_ACTION_MAP.pop(token, None)
-                bot.answer_callback_query(call.id, "Bot deleted.", show_alert=True)
+                answer_once( "Bot deleted.", show_alert=True)
                 bot.send_message(call.message.chat.id, f"🗑️ <b>Bot Deleted Successfully</b>\n\n📄 <code>{html_escape(fname)}</code>", parse_mode="HTML", protect_content=False)
                 _logic_check_files(call.message)
                 return
 
             if action == "back":
-                bot.answer_callback_query(call.id)
+                answer_once()
                 _logic_check_files(call.message)
                 return
 
-            bot.answer_callback_query(call.id, "Unknown action.", show_alert=True)
+            answer_once( "Unknown action.", show_alert=True)
             return
 
         elif data.startswith("file_"):
             _, owner_id, fname = data.split("_", 2)
             owner_id = int(owner_id)
             if not any(str(n) == fname for n, _ in user_files.get(owner_id, [])):
-                bot.answer_callback_query(call.id, "File is not available.", show_alert=True)
+                answer_once( "File is not available.", show_alert=True)
                 return
-            bot.answer_callback_query(call.id)
+            answer_once()
             bot.send_message(call.message.chat.id, f"🤖 <b>Bot Control Panel</b>\n\n📄 <code>{html_escape(fname)}</code>", reply_markup=_file_action_markup(owner_id, fname), parse_mode="HTML", protect_content=False)
 
         elif data.startswith("start_"):
@@ -2187,7 +2199,7 @@ def handle_callbacks(call):
             not_joined = check_force_sub(owner_id)
             
             if not_joined:
-                bot.answer_callback_query(call.id, "❌ আপনি এখনো সব চ্যানেলে জয়েন করেননি!", show_alert=True)
+                answer_once( "❌ আপনি এখনো সব চ্যানেলে জয়েন করেননি!", show_alert=True)
             else:
                 try: bot.delete_message(call.message.chat.id, call.message.message_id)
                 except: pass
@@ -2196,7 +2208,7 @@ def handle_callbacks(call):
         elif data.startswith("stop_"):
             _, owner_id, fname = data.split("_", 2)
             force_kill_user_bot(owner_id, fname)
-            bot.answer_callback_query(call.id, "Stopped!")
+            answer_once( "Stopped!")
             bot.send_message(call.message.chat.id, f"🛑 Script `{fname}` stopped successfully.", parse_mode="Markdown")
 
         elif data.startswith("del_"):
@@ -2212,13 +2224,13 @@ def handle_callbacks(call):
             pycache_dir = os.path.join(ufolder, "__pycache__")
             if os.path.exists(pycache_dir): shutil.rmtree(pycache_dir, ignore_errors=True)
                 
-            bot.answer_callback_query(call.id, "Deleted!")
+            answer_once( "Deleted!")
             bot.send_message(call.message.chat.id, f"🗑️ File `{fname}` completely deleted.", parse_mode="Markdown")
 
         elif data.startswith("instmod_"):
             _, owner_id, fname = data.split("_", 2)
             if int(user_id) != int(owner_id) and user_id not in admin_ids:
-                bot.answer_callback_query(call.id, "❌ এটি আপনার ফাইল নয়!", show_alert=True)
+                answer_once( "❌ এটি আপনার ফাইল নয়!", show_alert=True)
                 return
             install_missing_dependency(int(owner_id), fname, call.message.chat.id, call.id)
             return
@@ -2232,14 +2244,14 @@ def handle_callbacks(call):
                 markup = types.InlineKeyboardMarkup()
                 log_token = _make_file_action_token(owner_id, fname)
                 markup.add(make_inline_button("📋 Copy Full Log", callback_data=f"botact_{log_token}_copylog", style="primary"))
-                bot.answer_callback_query(call.id, "Log opened.")
+                answer_once( "Log opened.")
                 bot.send_message(
                     call.message.chat.id,
                     f"📜 <b>Runtime Logs — {html_escape(fname)}</b>\n\n<pre>{html_escape(logs if logs else 'No logs')}</pre>",
                     reply_markup=markup, parse_mode="HTML", protect_content=False
                 )
             else:
-                bot.answer_callback_query(call.id, "No logs!", show_alert=True)
+                answer_once( "No logs!", show_alert=True)
 
         elif data.startswith("copylog_"):
             _, owner_id, fname = data.split("_", 2)
@@ -2267,7 +2279,7 @@ def handle_callbacks(call):
                 conn.close()
             
             if not plans:
-                bot.answer_callback_query(call.id, "No plans found!", show_alert=True)
+                answer_once( "No plans found!", show_alert=True)
                 return
                 
             markup = types.InlineKeyboardMarkup()
@@ -2276,7 +2288,6 @@ def handle_callbacks(call):
             bot.send_message(call.message.chat.id, "Select a plan to delete:", reply_markup=markup)
 
         elif data.startswith("delplan_") and user_id in admin_ids:
-            bot.answer_callback_query(call.id)
             plan_id = data.split("_")[1]
             with DB_LOCK:
                 conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
@@ -2284,7 +2295,7 @@ def handle_callbacks(call):
                 c.execute("DELETE FROM plans WHERE plan_id=?", (plan_id,))
                 conn.commit()
                 conn.close()
-            bot.answer_callback_query(call.id, "Plan deleted!", show_alert=True)
+            answer_once( "Plan deleted!", show_alert=True)
             bot.send_message(call.message.chat.id, "✅ **প্ল্যান ডিলিট করা হয়েছে!**", parse_mode="Markdown")
 
         elif data == "give_plan" and user_id in admin_ids:
@@ -2308,7 +2319,7 @@ def handle_callbacks(call):
                 with DB_LOCK:
                     c.execute("INSERT OR REPLACE INTO user_subscriptions (user_id, plan_id, end_time, notified_warning) VALUES (?, ?, ?, 0)", (target_uid, plan_id, end_time.isoformat()))
                     conn.commit()
-                bot.answer_callback_query(call.id, "Plan assigned!", show_alert=True)
+                answer_once( "Plan assigned!", show_alert=True)
                 bot.send_message(call.message.chat.id, f"✅ User `{target_uid}` কে সফলভাবে **{plan_name}** দেওয়া হয়েছে!", parse_mode="Markdown")
                 
                 try:
@@ -2329,7 +2340,7 @@ def handle_callbacks(call):
         elif data == "remove_channel" and user_id in admin_ids:
             channels = get_force_channels()
             if not channels:
-                bot.answer_callback_query(call.id, "No channels added!", show_alert=True)
+                answer_once( "No channels added!", show_alert=True)
                 return
             markup = types.InlineKeyboardMarkup()
             for ch in channels:
@@ -2337,7 +2348,6 @@ def handle_callbacks(call):
             bot.send_message(call.message.chat.id, "Select a channel to remove:", reply_markup=markup)
 
         elif data.startswith("del_ch_") and user_id in admin_ids:
-            bot.answer_callback_query(call.id)
             ch_id = data[7:]
             with DB_LOCK:
                 conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
@@ -2345,7 +2355,7 @@ def handle_callbacks(call):
                 c.execute("DELETE FROM force_channels WHERE channel_id=?", (ch_id,))
                 conn.commit()
                 conn.close()
-            bot.answer_callback_query(call.id, "Channel removed successfully!", show_alert=True)
+            answer_once( "Channel removed successfully!", show_alert=True)
             bot.send_message(call.message.chat.id, f"✅ `{ch_id}` removed from Force Sub channels.")
 
         elif data == "add_admin" and int(user_id) in {int(OWNER_ID), int(globals().get("SECOND_ADMIN_ID", 0) or 0)}:
@@ -2375,11 +2385,11 @@ def handle_callbacks(call):
         elif data == "toggle_lock" and user_id in admin_ids:
             bot_locked = not bot_locked
             status = "🔒 Locked" if bot_locked else "🔓 Unlocked"
-            bot.answer_callback_query(call.id, f"Bot is now {status}", show_alert=True)
+            answer_once( f"Bot is now {status}", show_alert=True)
             bot.send_message(call.message.chat.id, f"✅ **Bot Lock Status Changed to:** {status}", parse_mode="Markdown")
 
         elif data == "stats" and user_id in admin_ids:
-            bot.answer_callback_query(call.id)
+            answer_once()
             msg = (
                 f"📊 **𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝗶𝘀𝘁𝗶𝗰𝘀:**\n\n"
                 f"👥 **Total Users:** `{len(active_users)}`\n"
@@ -2391,7 +2401,7 @@ def handle_callbacks(call):
             bot.send_message(call.message.chat.id, msg, parse_mode="Markdown")
 
         elif data == "run_all_scripts" and user_id in admin_ids:
-            bot.answer_callback_query(call.id, "Running all stopped scripts...")
+            answer_once( "Running all stopped scripts...")
             started_count = 0
             for uid, files in user_files.items():
                 for fname, ftype in files:
@@ -2406,10 +2416,13 @@ def handle_callbacks(call):
                             started_count += 1
                             time.sleep(1)
             bot.send_message(call.message.chat.id, f"✅ **Successfully started {started_count} scripts!**", parse_mode="Markdown")
+        else:
+            answer_once("This button is not available anymore.", show_alert=True)
+            logger.warning("Unhandled callback data: %s", data)
     except Exception as e:
         logger.error(f"Error handling callback {getattr(call, 'data', '')}: {e}", exc_info=True)
         try:
-            bot.answer_callback_query(call.id, "❌ Action failed. Check the bot logs.", show_alert=True)
+            answer_once( "❌ Action failed. Check the bot logs.", show_alert=True)
         except Exception:
             pass
 
@@ -2818,8 +2831,14 @@ def handle_text_messages(message):
         action = BUTTON_MAPPING.get(text)
         if action:
             action(message)
+        elif text:
+            bot.send_message(message.chat.id, "ℹ️ এই বাটনটি আর সক্রিয় নেই। /start দিয়ে মেনু রিফ্রেশ করুন।")
     except Exception as e:
-        logger.error(f"Error handling message text: {e}")
+        logger.error(f"Error handling message text: {e}", exc_info=True)
+        try:
+            bot.send_message(message.chat.id, "❌ <b>Button action failed.</b> Please tap the button again.", parse_mode="HTML")
+        except Exception:
+            pass
 
 # =====================================================================
 # SECOND BOT CONFIGURATION
