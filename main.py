@@ -2826,7 +2826,7 @@ def handle_text_messages(message):
 # Keep these values after the main code as requested.
 # Replace only the two placeholders below.
 # =====================================================================
-SECOND_BOT_TOKEN = os.environ.get("SECOND_BOT_TOKEN", "8975915610:AAFyMVM5vFyfWNurx-uUKaEj3bU_zC2LUPU").strip()
+SECOND_BOT_TOKEN = os.environ.get("SECOND_BOT_TOKEN", "").strip()
 SECOND_ADMIN_ID = 8814363793
 
 APPROVAL_ADMIN_IDS = {int(OWNER_ID), int(ADMIN_ID)}
@@ -2843,8 +2843,13 @@ if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is missing. Set your Telegram bot token in Render/Replit environment variables.")
 
 BOT_INSTANCES = [telebot.TeleBot(TOKEN)]
-if SECOND_BOT_TOKEN and SECOND_BOT_TOKEN != "PUT_NEW_BOT_TOKEN_HERE":
+
+# SECOND_BOT_TOKEN is optional. Never start polling the same Telegram token twice,
+# because Telegram allows only one active getUpdates/polling consumer per bot.
+if SECOND_BOT_TOKEN and SECOND_BOT_TOKEN != TOKEN and SECOND_BOT_TOKEN != "PUT_NEW_BOT_TOKEN_HERE":
     BOT_INSTANCES.append(telebot.TeleBot(SECOND_BOT_TOKEN))
+elif SECOND_BOT_TOKEN == TOKEN:
+    logger.warning("SECOND_BOT_TOKEN is the same as BOT_TOKEN; second polling instance disabled.")
 
 bot._default = BOT_INSTANCES[0]
 
