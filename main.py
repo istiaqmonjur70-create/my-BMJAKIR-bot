@@ -63,7 +63,7 @@ TOKEN = "8910223271:AAEGc6ZTC4qE6FkOBLL13Xj0QwtQyfCI7CU"
 OWNER_ID = 8814363793
 ADMIN_ID = 8814363793
 YOUR_USERNAME = "@DevCloudX"
-UPDATE_CHANNEL = "https://t.me/JAKIRLABS
+UPDATE_CHANNEL = "https://t.me/JAKIRLABS"
 UPLOAD_LOG_CHANNEL = "@ajajakkalqkqkqjajakl" # ফাইল upload log (not used for source forwarding)
 # Private admin group for deposit/plan activity only. Set your group chat ID here.
 # Uploaded .py/.js files are NEVER sent to this group.
