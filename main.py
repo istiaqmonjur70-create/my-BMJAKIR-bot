@@ -16,6 +16,13 @@ from flask import Flask
 from threading import Thread
 import psutil
 import telebot
+import telebot
+bot = telebot.TeleBot("8910223271:AAEGc6ZTC4qE6FkOBLL13Xj0QwtQyfCI7CU")
+# আগের কোনো ওয়েবহুক চালু থাকলে তা ডিলিট করে দিবে
+bot.remove_webhook()
+# এরপর আপনার বাকি কোড ও পোলিং শুরু হবে
+bot.infinity_polling()
+
 from telebot import types
 from types import SimpleNamespace
 
