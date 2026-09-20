@@ -43,7 +43,7 @@ def keep_alive():
 TOKEN = "8910223271:AAEGc6ZTC4qE6FkOBLL13Xj0QwtQyfCI7CU"
 OWNER_ID = 8814363793
 ADMIN_ID = 8814363793
-YOUR_USERNAME = "@DevCloudX"
+YOUR_USERNAME = "@Bmjakir69"
 UPDATE_CHANNEL = "https://t.me/JAKIRLABS"
 UPLOAD_LOG_CHANNEL = "@ajajakkalqkqkqjajakl" # ফাইল আপলোড নোটিফিকেশন চ্যানেল
 
@@ -2209,7 +2209,7 @@ def handle_text_messages(message):
 # Keep these values after the main code as requested.
 # Replace only the two placeholders below.
 # =====================================================================
-SECOND_BOT_TOKEN = "8975915610:AAFyMVM5vFyfWNurx-uUKaEj3bU_zC2LUPU"
+SECOND_BOT_TOKEN = "8910223271:AAEGc6ZTC4qE6FkOBLL13Xj0QwtQyfCI7CU"
 SECOND_ADMIN_ID = 8814363793
 
 APPROVAL_ADMIN_IDS = {int(OWNER_ID), int(ADMIN_ID)}
