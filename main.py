@@ -110,6 +110,10 @@ bot = BotProxy()
 # --- Data structures ---
 bot_scripts = {}
 user_files = {}
+# Short-lived callback tokens keep Telegram callback_data well under the 64-byte limit
+# even when uploaded filenames are long or contain underscores.
+FILE_ACTION_MAP = {}
+FILE_ACTION_LOCK = threading.Lock()
 active_users = set()
 admin_ids = {ADMIN_ID, OWNER_ID}
 blocked_users = set()
@@ -1061,12 +1065,15 @@ def send_runtime_log(chat_id, owner_id, file_name, callback_id=None):
 
 
 def _error_action_markup(owner_id, file_name, package_name=None):
+    # Always use short opaque callback tokens. Telegram limits callback_data to 64 bytes,
+    # and real uploaded filenames can be very long or contain many underscores.
+    token = _make_file_action_token(owner_id, file_name)
     markup = types.InlineKeyboardMarkup(row_width=2)
     if package_name:
-        markup.add(make_inline_button(f"📦 Install {package_name}", callback_data=f"instmod_{owner_id}_{file_name}"))
+        markup.add(make_inline_button(f"📦 Install {package_name}", callback_data=f"botact_{token}_install", style="success"))
     markup.add(
-        make_inline_button("📄 View Logs", callback_data=f"viewlog_{owner_id}_{file_name}"),
-        make_inline_button("📋 Copy Full Log", callback_data=f"copylog_{owner_id}_{file_name}")
+        make_inline_button("📄 View Logs", callback_data=f"botact_{token}_log", style="primary"),
+        make_inline_button("📋 Copy Full Log", callback_data=f"botact_{token}_copylog", style="primary")
     )
     return markup
 
@@ -1555,6 +1562,44 @@ def _logic_upload_file(message):
     bot.send_message(message.chat.id, "🚀 **আপনার Python (.py) অথবা JS (.js) বোট ফাইলটি মেসেজে আপলোড করুন।**\n"
                           "*(ফাইল দেওয়ার পর ফাইলটি সেভ হবে। এরপর Manage Files থেকে বোটটি চালু করতে হবে)*", parse_mode="Markdown")
 
+def _make_file_action_token(owner_id, file_name):
+    token = uuid.uuid4().hex[:16]
+    with FILE_ACTION_LOCK:
+        FILE_ACTION_MAP[token] = (int(owner_id), str(file_name), time.time())
+        # Keep memory bounded. Tokens older than 2 hours are discarded.
+        cutoff = time.time() - 7200
+        for k, v in list(FILE_ACTION_MAP.items()):
+            try:
+                if float(v[2]) < cutoff:
+                    FILE_ACTION_MAP.pop(k, None)
+            except Exception:
+                FILE_ACTION_MAP.pop(k, None)
+    return token
+
+def _get_file_action(token):
+    with FILE_ACTION_LOCK:
+        item = FILE_ACTION_MAP.get(str(token))
+        if not item:
+            return None
+        if time.time() - float(item[2]) > 7200:
+            FILE_ACTION_MAP.pop(str(token), None)
+            return None
+        return int(item[0]), str(item[1])
+
+def _file_action_markup(owner_id, fname):
+    token = _make_file_action_token(owner_id, fname)
+    running = is_bot_running(owner_id, fname)
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if running:
+        markup.add(make_inline_button('🛑 Bot Off / Stop', callback_data=f'botact_{token}_stop', style='danger'))
+    else:
+        markup.add(make_inline_button('▶️ Bot On / Start', callback_data=f'botact_{token}_start', style='success'))
+    markup.add(make_inline_button('📜 Bot Logs', callback_data=f'botact_{token}_log', style='primary'))
+    markup.add(make_inline_button('📋 Full Log', callback_data=f'botact_{token}_copylog', style='primary'))
+    markup.add(make_inline_button('🗑️ Bot Delete', callback_data=f'botact_{token}_delete', style='danger'))
+    markup.add(make_inline_button('🔙 Back to Bot List', callback_data=f'botact_{token}_back', style='primary'))
+    return markup
+
 def _logic_check_files(message):
     user_id = message.from_user.id
     user_files_list = user_files.get(user_id, [])
@@ -1566,7 +1611,8 @@ def _logic_check_files(message):
         is_running = is_bot_running(user_id, file_name)
         status_icon = "🟢 Running" if is_running else "🔴 Stopped"
         btn_text = f"📄 {file_name} ({file_type}) - {status_icon}"
-        markup.add(make_inline_button(btn_text, callback_data=f"file_{user_id}_{file_name}"))
+        token = _make_file_action_token(user_id, file_name)
+        markup.add(make_inline_button(btn_text, callback_data=f"filemenu_{token}"))
     bot.send_message(message.chat.id, f"📁 **𝗠𝗮𝗻𝗮𝗴𝗲 𝗬𝗼𝘂𝗿 𝗙𝗶𝗹𝗲𝘀 ({len(user_files_list)}/{get_user_file_limit(user_id)}):**", reply_markup=markup, parse_mode="Markdown", protect_content=False)
 
 def _logic_vip_plans(message):
@@ -1755,12 +1801,19 @@ def handle_callbacks(call):
         global bot_locked
         data = call.data
 
-        if data.startswith(("file_", "start_", "verify_", "stop_", "del_", "instmod_", "viewlog_", "copylog_", "extend_")):
-            parts = data.split("_")
-            owner_id = int(parts[1])
-            if user_id != owner_id and user_id not in admin_ids:
-                bot.answer_callback_query(call.id, "❌ নিরাপত্তা সতর্কতা: এটি আপনার ফাইল নয়!", show_alert=True)
-                return
+        # Legacy file-action callbacks contain a numeric owner id.  Do NOT treat
+        # admin callbacks such as delplan_* / del_ch_* as file callbacks; both
+        # also begin with ``del_`` and the old generic check caused int("plan")
+        # / int("ch") errors, making those inner Admin Panel buttons appear dead.
+        legacy_file_prefixes = ("file_", "start_", "verify_", "stop_", "del_", "instmod_", "viewlog_", "copylog_", "extend_")
+        is_admin_delete_callback = data.startswith(("delplan_", "del_ch_"))
+        if data.startswith(legacy_file_prefixes) and not is_admin_delete_callback:
+            parts = data.split("_", 2)
+            if len(parts) >= 2 and parts[1].isdigit():
+                owner_id = int(parts[1])
+                if user_id != owner_id and user_id not in admin_ids:
+                    bot.answer_callback_query(call.id, "❌ নিরাপত্তা সতর্কতা: এটি আপনার ফাইল নয়!", show_alert=True)
+                    return
 
         if data.startswith("approve_file_") and user_id in APPROVAL_ADMIN_IDS:
             request_id = data[len("approve_file_"):]
@@ -1941,6 +1994,7 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_deposit_trx)
 
         elif data.startswith("dep_app_") and user_id in admin_ids:
+            bot.answer_callback_query(call.id, "Processing approval...")
             parts = data.split("_")
             target_uid = int(parts[2])
             amount = int(parts[3])
@@ -1957,6 +2011,7 @@ def handle_callbacks(call):
             except: pass
 
         elif data.startswith("dep_rej_") and user_id in admin_ids:
+            bot.answer_callback_query(call.id, "Processing rejection...")
             parts = data.split("_")
             target_uid = int(parts[2])
             amount = int(parts[3])
@@ -1969,21 +2024,145 @@ def handle_callbacks(call):
             bot.answer_callback_query(call.id, "💎 Free limit is 12 hours. Please buy a plan to continue.", show_alert=True)
             _logic_vip_plans(call.message)
 
+        elif data.startswith("filemenu_"):
+            token = data[len("filemenu_"):]
+            item = _get_file_action(token)
+            if not item:
+                bot.answer_callback_query(call.id, "This menu expired. Open Manage Files again.", show_alert=True)
+                return
+            owner_id, fname = item
+            if user_id != owner_id and user_id not in admin_ids:
+                bot.answer_callback_query(call.id, "❌ এটি আপনার বোট নয়!", show_alert=True)
+                return
+            if not any(str(n) == fname for n, _ in user_files.get(owner_id, [])):
+                bot.answer_callback_query(call.id, "File is not available.", show_alert=True)
+                return
+            running = is_bot_running(owner_id, fname)
+            status = "🟢 Running" if running else "🔴 Stopped"
+            markup = _file_action_markup(owner_id, fname)
+            bot.answer_callback_query(call.id)
+            bot.send_message(
+                call.message.chat.id,
+                f"🤖 <b>Bot Control Panel</b>\n\n📄 <b>File:</b> <code>{html_escape(fname)}</code>\n🚦 <b>Status:</b> {status}\n\nChoose an action:",
+                reply_markup=markup, parse_mode="HTML", protect_content=False
+            )
+
+        elif data.startswith("botact_"):
+            parts = data.split("_")
+            if len(parts) < 3:
+                bot.answer_callback_query(call.id, "Invalid action.", show_alert=True)
+                return
+            token, action = parts[1], parts[2]
+            item = _get_file_action(token)
+            if not item:
+                bot.answer_callback_query(call.id, "This menu expired. Open Manage Files again.", show_alert=True)
+                return
+            owner_id, fname = item
+            if user_id != owner_id and user_id not in admin_ids:
+                bot.answer_callback_query(call.id, "❌ এটি আপনার বোট নয়!", show_alert=True)
+                return
+            if not any(str(n) == fname for n, _ in user_files.get(owner_id, [])):
+                bot.answer_callback_query(call.id, "File is no longer available.", show_alert=True)
+                return
+
+            if action == "start":
+                not_joined = check_force_sub(owner_id)
+                if not_joined and owner_id not in admin_ids:
+                    markup = types.InlineKeyboardMarkup(row_width=1)
+                    for ch_id, ch_url in not_joined:
+                        markup.add(make_inline_button("📢 Join Channel", url=ch_url))
+                    markup.add(make_inline_button("✅ Verify", callback_data=f"botact_{token}_verify", style="success"))
+                    bot.answer_callback_query(call.id)
+                    bot.send_message(call.message.chat.id, "⚠️ <b>Start করার আগে প্রয়োজনীয় চ্যানেলে Join করুন।</b>", reply_markup=markup, parse_mode="HTML")
+                    return
+                do_start_bot(owner_id, fname, call.message, call.id)
+                return
+
+            if action == "stop":
+                force_kill_user_bot(owner_id, fname)
+                bot.answer_callback_query(call.id, "Bot stopped.", show_alert=True)
+                markup = _file_action_markup(owner_id, fname)
+                bot.send_message(call.message.chat.id, f"🛑 <b>Bot Off</b>\n\n📄 <code>{html_escape(fname)}</code>\n🚦 Status: 🔴 Stopped", reply_markup=markup, parse_mode="HTML", protect_content=False)
+                return
+
+            if action == "verify":
+                not_joined = check_force_sub(owner_id)
+                if not_joined and owner_id not in admin_ids:
+                    markup = types.InlineKeyboardMarkup(row_width=1)
+                    for ch_id, ch_url in not_joined:
+                        markup.add(make_inline_button("📢 Join Channel", url=ch_url))
+                    verify_token = _make_file_action_token(owner_id, fname)
+                    markup.add(make_inline_button("✅ Verify Again", callback_data=f"botact_{verify_token}_verify", style="success"))
+                    bot.answer_callback_query(call.id, "❌ এখনো সব চ্যানেলে Join করা হয়নি।", show_alert=True)
+                    bot.send_message(call.message.chat.id, "⚠️ <b>প্রথমে প্রয়োজনীয় Channel-এ Join করুন, তারপর Verify করুন।</b>", reply_markup=markup, parse_mode="HTML")
+                    return
+                try:
+                    bot.delete_message(call.message.chat.id, call.message.message_id)
+                except Exception:
+                    pass
+                do_start_bot(owner_id, fname, call.message, call.id)
+                return
+
+            if action == "install":
+                install_missing_dependency(owner_id, fname, call.message.chat.id, call.id)
+                return
+
+            if action == "log":
+                log_fpath = _log_path_for(owner_id, fname)
+                if not os.path.exists(log_fpath):
+                    bot.answer_callback_query(call.id, "No runtime log found yet.", show_alert=True)
+                    return
+                with open(log_fpath, "r", encoding="utf-8", errors="replace") as f:
+                    logs = f.read()[-3500:]
+                markup = types.InlineKeyboardMarkup(row_width=2)
+                markup.add(make_inline_button("📋 Full Log", callback_data=f"botact_{token}_copylog"))
+                markup.add(make_inline_button("🔙 Bot Control", callback_data=f"filemenu_{token}"))
+                bot.answer_callback_query(call.id, "Logs opened.")
+                bot.send_message(call.message.chat.id, f"📜 <b>Bot Logs</b>\n📄 <code>{html_escape(fname)}</code>\n\n<pre>{html_escape(logs if logs else 'No logs')}</pre>", reply_markup=markup, parse_mode="HTML", protect_content=False)
+                return
+
+            if action == "copylog":
+                send_runtime_log(call.message.chat.id, owner_id, fname, call.id)
+                return
+
+            if action == "delete":
+                force_kill_user_bot(owner_id, fname)
+                remove_user_file_db(owner_id, fname)
+                ufolder = get_user_folder(owner_id)
+                fpath = os.path.join(ufolder, fname)
+                log_fpath = os.path.join(ufolder, f"{os.path.splitext(fname)[0]}.log")
+                for path in (fpath, log_fpath):
+                    try:
+                        if os.path.exists(path):
+                            os.remove(path)
+                    except Exception as e:
+                        logger.warning("Could not delete %s: %s", path, e)
+                pycache_dir = os.path.join(ufolder, "__pycache__")
+                if os.path.exists(pycache_dir):
+                    shutil.rmtree(pycache_dir, ignore_errors=True)
+                with FILE_ACTION_LOCK:
+                    FILE_ACTION_MAP.pop(token, None)
+                bot.answer_callback_query(call.id, "Bot deleted.", show_alert=True)
+                bot.send_message(call.message.chat.id, f"🗑️ <b>Bot Deleted Successfully</b>\n\n📄 <code>{html_escape(fname)}</code>", parse_mode="HTML", protect_content=False)
+                _logic_check_files(call.message)
+                return
+
+            if action == "back":
+                bot.answer_callback_query(call.id)
+                _logic_check_files(call.message)
+                return
+
+            bot.answer_callback_query(call.id, "Unknown action.", show_alert=True)
+            return
+
         elif data.startswith("file_"):
             _, owner_id, fname = data.split("_", 2)
             owner_id = int(owner_id)
             if not any(str(n) == fname for n, _ in user_files.get(owner_id, [])):
                 bot.answer_callback_query(call.id, "File is not available.", show_alert=True)
                 return
-            is_running = is_bot_running(owner_id, fname)
-            markup = types.InlineKeyboardMarkup(row_width=2)
-            if is_running:
-                markup.add(make_inline_button("🛑 Stop Bot", callback_data=f"stop_{owner_id}_{fname}", style="danger"))
-            else:
-                markup.add(make_inline_button("▶️ Start Bot", callback_data=f"start_{owner_id}_{fname}", style="success"))
-            markup.add(make_inline_button("🗑️ Delete Bot File", callback_data=f"del_{owner_id}_{fname}", style="danger"))
             bot.answer_callback_query(call.id)
-            bot.send_message(call.message.chat.id, f"📄 <b>File:</b> <code>{html_escape(fname)}</code>\n🚦 <b>Status:</b> {'🟢 Running' if is_running else '🔴 Stopped'}", reply_markup=markup, parse_mode="HTML", protect_content=False)
+            bot.send_message(call.message.chat.id, f"🤖 <b>Bot Control Panel</b>\n\n📄 <code>{html_escape(fname)}</code>", reply_markup=_file_action_markup(owner_id, fname), parse_mode="HTML", protect_content=False)
 
         elif data.startswith("start_"):
             _, owner_id, fname = data.split("_", 2)
@@ -1994,7 +2173,8 @@ def handle_callbacks(call):
                 markup = types.InlineKeyboardMarkup(row_width=1)
                 for ch_id, ch_url in not_joined:
                     markup.add(make_inline_button("📢 Join Channel", url=ch_url))
-                markup.add(make_inline_button("✅ Verify", callback_data=f"verify_{owner_id}_{fname}"))
+                verify_token = _make_file_action_token(owner_id, fname)
+                markup.add(make_inline_button("✅ Verify", callback_data=f"botact_{verify_token}_verify", style="success"))
                 
                 bot.send_message(call.message.chat.id, "⚠️ **আপনার বোট স্টার্ট করতে হলে প্রথমে আমাদের নিচের চ্যানেলগুলোতে জয়েন করুন:**", reply_markup=markup, parse_mode="Markdown")
                 return
@@ -2050,7 +2230,8 @@ def handle_callbacks(call):
                 with open(log_fpath, "r", encoding="utf-8", errors="replace") as f:
                     logs = f.read()[-3500:]
                 markup = types.InlineKeyboardMarkup()
-                markup.add(make_inline_button("📋 Copy Full Log", callback_data=f"copylog_{owner_id}_{fname}"))
+                log_token = _make_file_action_token(owner_id, fname)
+                markup.add(make_inline_button("📋 Copy Full Log", callback_data=f"botact_{log_token}_copylog", style="primary"))
                 bot.answer_callback_query(call.id, "Log opened.")
                 bot.send_message(
                     call.message.chat.id,
@@ -2095,6 +2276,7 @@ def handle_callbacks(call):
             bot.send_message(call.message.chat.id, "Select a plan to delete:", reply_markup=markup)
 
         elif data.startswith("delplan_") and user_id in admin_ids:
+            bot.answer_callback_query(call.id)
             plan_id = data.split("_")[1]
             with DB_LOCK:
                 conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
@@ -2155,6 +2337,7 @@ def handle_callbacks(call):
             bot.send_message(call.message.chat.id, "Select a channel to remove:", reply_markup=markup)
 
         elif data.startswith("del_ch_") and user_id in admin_ids:
+            bot.answer_callback_query(call.id)
             ch_id = data[7:]
             with DB_LOCK:
                 conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
