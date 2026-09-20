@@ -2245,6 +2245,7 @@ _register_proxy_handlers()
 def _poll_bot(real_bot, label):
     bot.bind(real_bot)
     logger.info("%s polling started.", label)
+    real_bot.remove_webhook()
     while True:
         try:
             real_bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
@@ -2254,6 +2255,7 @@ def _poll_bot(real_bot, label):
         except Exception as e:
             logger.error("%s polling error: %s", label, e)
             time.sleep(15)
+
 
 if __name__ == "__main__":
     keep_alive()
