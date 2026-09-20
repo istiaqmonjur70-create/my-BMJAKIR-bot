@@ -2223,7 +2223,11 @@ if SECOND_ADMIN_ID:
         conn.close()
 
 BOT_INSTANCES = [telebot.TeleBot(TOKEN)]
-if SECOND_BOT_TOKEN and SECOND_BOT_TOKEN != "PUT_NEW_BOT_TOKEN_HERE":
+if (
+    SECOND_BOT_TOKEN
+    and SECOND_BOT_TOKEN != "PUT_NEW_BOT_TOKEN_HERE"
+    and SECOND_BOT_TOKEN != TOKEN
+):
     BOT_INSTANCES.append(telebot.TeleBot(SECOND_BOT_TOKEN))
 
 bot._default = BOT_INSTANCES[0]
