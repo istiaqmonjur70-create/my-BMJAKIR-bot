@@ -1412,8 +1412,14 @@ def handle_callbacks(call):
         global bot_locked
         data = call.data
 
-        if data.startswith(("file_", "start_", "verify_", "stop_", "del_", "instmod_", "viewlog_", "extend_")):
-            parts = data.split("_")
+        # File-control callbacks contain an owner ID.  Do NOT include del_ch_* here:
+        # channel deletion uses a channel id, not a user id.
+        protected_prefixes = ("file_", "start_", "verify_", "stop_", "del_", "instmod_", "viewlog_", "copylog_", "downloadlog_", "restart_", "extend_")
+        if data.startswith(protected_prefixes) and not data.startswith("del_ch_"):
+            parts = data.split("_", 2)
+            if len(parts) < 2 or not str(parts[1]).lstrip("-").isdigit():
+                bot.answer_callback_query(call.id, "❌ Invalid callback data.", show_alert=True)
+                return
             owner_id = int(parts[1])
             if user_id != owner_id and user_id not in admin_ids:
                 bot.answer_callback_query(call.id, "❌ নিরাপত্তা সতর্কতা: এটি আপনার ফাইল নয়!", show_alert=True)
@@ -1632,8 +1638,13 @@ def handle_callbacks(call):
             markup = types.InlineKeyboardMarkup(row_width=2)
             if is_running:
                 markup.add(make_inline_button("🛑 Stop Bot", callback_data=f"stop_{owner_id}_{fname}"))
+                markup.add(make_inline_button("🔄 Restart Bot", callback_data=f"restart_{owner_id}_{fname}"))
             else:
                 markup.add(make_inline_button("▶️ Start Bot", callback_data=f"start_{owner_id}_{fname}"))
+            markup.add(
+                make_inline_button("📜 View Logs", callback_data=f"viewlog_{owner_id}_{fname}"),
+                make_inline_button("📥 Copy/Send Logs", callback_data=f"copylog_{owner_id}_{fname}")
+            )
             markup.add(make_inline_button("🗑️ Delete Bot File", callback_data=f"del_{owner_id}_{fname}"))
             bot.send_message(call.message.chat.id, f"📄 **File:** `{fname}`\n🚦 Status: `{'🟢 Running' if is_running else '🔴 Stopped'}`", reply_markup=markup, parse_mode="Markdown", protect_content=True)
 
@@ -1664,6 +1675,38 @@ def handle_callbacks(call):
                 try: bot.delete_message(call.message.chat.id, call.message.message_id)
                 except: pass
                 do_start_bot(owner_id, fname, call.message, call.id)
+
+        elif data.startswith("restart_"):
+            _, owner_id, fname = data.split("_", 2)
+            owner_id = int(owner_id)
+            force_kill_user_bot(owner_id, fname)
+            time.sleep(0.5)
+            do_start_bot(owner_id, fname, call.message, call.id)
+
+        elif data.startswith("copylog_") or data.startswith("downloadlog_"):
+            _, owner_id, fname = data.split("_", 2)
+            owner_id = int(owner_id)
+            log_fpath = os.path.join(get_user_folder(owner_id), f"{os.path.splitext(fname)[0]}.log")
+            if not os.path.exists(log_fpath):
+                bot.answer_callback_query(call.id, "No logs available yet.", show_alert=True)
+                return
+            try:
+                size = os.path.getsize(log_fpath)
+                if size == 0:
+                    bot.answer_callback_query(call.id, "Log file is empty.", show_alert=True)
+                    return
+                with open(log_fpath, "rb") as logf:
+                    bot.send_document(
+                        call.message.chat.id,
+                        logf,
+                        caption=f"📜 <b>Bot Logs</b>\n\n📄 <code>{fname}</code>\n📦 <code>{size} bytes</code>",
+                        parse_mode="HTML",
+                        protect_content=True
+                    )
+                bot.answer_callback_query(call.id, "Logs sent successfully.")
+            except Exception as e:
+                logger.error("Log send failed: %s", e, exc_info=True)
+                bot.answer_callback_query(call.id, "Could not send logs.", show_alert=True)
 
         elif data.startswith("stop_"):
             _, owner_id, fname = data.split("_", 2)
@@ -1699,8 +1742,20 @@ def handle_callbacks(call):
             _, owner_id, fname = data.split("_", 2)
             log_fpath = os.path.join(get_user_folder(int(owner_id)), f"{os.path.splitext(fname)[0]}.log")
             if os.path.exists(log_fpath):
-                with open(log_fpath, "r", encoding="utf-8", errors="ignore") as f: logs = f.read()[-2000:]
-                bot.send_message(call.message.chat.id, f"📜 **Logs:**\n\n```\n{logs if logs else 'No logs'}\n```", parse_mode="Markdown", protect_content=True)
+                with open(log_fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    logs = f.read()[-3500:]
+                from html import escape as html_escape
+                safe_logs = html_escape(logs if logs else "No logs")
+                markup = types.InlineKeyboardMarkup(row_width=2)
+                markup.add(make_inline_button("📥 Send Full Log", callback_data=f"copylog_{owner_id}_{fname}"))
+                bot.send_message(
+                    call.message.chat.id,
+                    f"📜 <b>Logs:</b> <code>{html_escape(fname)}</code>\n\n<pre>{safe_logs}</pre>",
+                    reply_markup=markup,
+                    parse_mode="HTML",
+                    protect_content=True
+                )
+                bot.answer_callback_query(call.id, "Logs loaded.")
             else:
                 bot.answer_callback_query(call.id, "No logs!", show_alert=True)
 
@@ -1863,7 +1918,11 @@ def handle_callbacks(call):
                             time.sleep(1)
             bot.send_message(call.message.chat.id, f"✅ **Successfully started {started_count} scripts!**", parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"Error handling callback {call.data}: {e}")
+        logger.error(f"Error handling callback {getattr(call, 'data', '')}: {e}", exc_info=True)
+        try:
+            bot.answer_callback_query(call.id, "❌ এই বাটনটি প্রসেস করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।", show_alert=True)
+        except Exception:
+            pass
 
 # --- Deposit Input Process Handlers ---
 def process_deposit_amount(message):
@@ -2246,6 +2305,22 @@ def _register_proxy_handlers():
 _register_proxy_handlers()
 
 # --- App Start ---
+def _cleanup_dead_script_entries():
+    for key in list(bot_scripts.keys()):
+        info = bot_scripts.get(key) or {}
+        proc = info.get("process")
+        try:
+            if proc is not None and proc.poll() is not None:
+                try:
+                    if info.get("log_file") and not info["log_file"].closed:
+                        info["log_file"].close()
+                except Exception:
+                    pass
+                bot_scripts.pop(key, None)
+        except Exception:
+            pass
+
+
 def _poll_bot(real_bot, label):
     bot.bind(real_bot)
     logger.info("%s polling started.", label)
