@@ -40,9 +40,9 @@ def keep_alive():
     print("Flask Keep-Alive server started.")
 
 # --- Configuration ---
-TOKEN = "8910223271:AAEGc6ZTC4qE6FkOBLL13Xj0QwtQyfCI7CU"
-OWNER_ID = 8814363793
-ADMIN_ID = 8814363793
+TOKEN = "8856143574:AAH34gOh_iYVIyktjKZvKVtoEKXtxYny0Co"
+OWNER_ID = 8889726455
+ADMIN_ID = 6442375982
 YOUR_USERNAME = "@ModderSanto"
 UPDATE_CHANNEL = "https://t.me/ModderSanto_Official"
 UPLOAD_LOG_CHANNEL = "@all0notification" # ফাইল আপলোড নোটিফিকেশন চ্যানেল
