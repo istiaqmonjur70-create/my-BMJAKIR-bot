@@ -1071,6 +1071,109 @@ def _error_action_markup(owner_id, file_name, package_name=None):
     return markup
 
 
+
+AUTO_INSTALL_MAX_ROUNDS = 5
+AUTO_INSTALL_STATE = {}
+
+def _run_installer_command(cmd, cwd, timeout=900):
+    """Run a package installer without a shell and return (ok, output)."""
+    logger.info("Auto installer command: %s", cmd)
+    try:
+        result = subprocess.run(
+            cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            shell=False, env=os.environ.copy()
+        )
+        output = (result.stdout or "").strip()
+        return result.returncode == 0, output
+    except subprocess.TimeoutExpired as e:
+        out = getattr(e, "stdout", "") or ""
+        return False, str(out) + "\nInstaller timeout."
+    except Exception as e:
+        return False, str(e)
+
+
+def _install_declared_dependencies(owner_id, file_name, notify_chat_id=None):
+    """Install requirements.txt/package.json dependencies before starting a bot."""
+    folder = get_user_folder(int(owner_id))
+    ext = os.path.splitext(file_name)[1].lower()
+    results = []
+
+    if ext == ".py":
+        req = os.path.join(folder, "requirements.txt")
+        if os.path.isfile(req):
+            ok, out = _run_installer_command([
+                sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+                "--no-input", "--upgrade", "--no-cache-dir", "--target", folder, "-r", req
+            ], folder)
+            results.append(("requirements.txt", ok, out))
+    elif ext == ".js":
+        pkg = os.path.join(folder, "package.json")
+        if os.path.isfile(pkg):
+            if shutil.which("npm") is None:
+                results.append(("package.json", False, "npm is not installed on this server"))
+            else:
+                ok, out = _run_installer_command([
+                    "npm", "install", "--no-audit", "--no-fund", "--prefix", folder
+                ], folder)
+                results.append(("package.json", ok, out))
+
+    if notify_chat_id and results:
+        for name, ok, out in results:
+            if ok:
+                _send_status(notify_chat_id, f"✅ <b>{html_escape(name)} installed.</b>")
+            else:
+                _send_status(notify_chat_id, f"❌ <b>{html_escape(name)} install failed.</b>\n<pre>{html_escape(out[-1800:])}</pre>")
+    return results
+
+
+def _auto_install_missing_from_log(owner_id, file_name, log_path, chat_id):
+    """Install the missing module detected in a crash log. Returns True on success."""
+    module, package, manager = _missing_dependency_from_log(log_path, file_name)
+    if not package or not _safe_package_name(package):
+        return False
+
+    # Avoid installing the same missing package repeatedly.
+    state_key = f"{owner_id}_{file_name}"
+    tried = AUTO_INSTALL_STATE.setdefault(state_key, set())
+    key = f"{manager}:{package}"
+    if key in tried:
+        return False
+    if len(tried) >= AUTO_INSTALL_MAX_ROUNDS:
+        return False
+    tried.add(key)
+
+    _send_status(chat_id, f"🔧 <b>Missing package detected automatically</b>\n📦 <code>{html_escape(package)}</code>\n⏳ Installing now…")
+    folder = get_user_folder(owner_id)
+    if manager == "pip":
+        cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--upgrade", "--no-cache-dir", "--target", folder, package]
+    else:
+        if shutil.which("npm") is None:
+            _send_status(chat_id, "❌ <b>npm is not installed on this server.</b>")
+            return False
+        cmd = ["npm", "install", "--no-audit", "--no-fund", "--prefix", folder, package]
+
+    ok, output = _run_installer_command(cmd, folder, timeout=900)
+    if not ok:
+        _send_status(chat_id, f"❌ <b>Auto-install failed:</b> <code>{html_escape(package)}</code>\n<pre>{html_escape(output[-2200:] or 'No installer output')}</pre>")
+        return False
+
+    if manager == "pip" and module:
+        verify_env = os.environ.copy()
+        old_pp = verify_env.get("PYTHONPATH", "")
+        verify_env["PYTHONPATH"] = folder + (os.pathsep + old_pp if old_pp else "")
+        verify = subprocess.run([
+            sys.executable, "-c", f"import {module}"
+        ], cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+           text=True, encoding="utf-8", errors="replace", timeout=60,
+           shell=False, env=verify_env)
+        if verify.returncode != 0:
+            _send_status(chat_id, f"⚠️ <b>Installed but import still failed:</b> <code>{html_escape(module)}</code>\n<pre>{html_escape((verify.stderr or verify.stdout or '')[-1800:])}</pre>")
+            return False
+
+    _send_status(chat_id, f"✅ <b>Auto-installed:</b> <code>{html_escape(package)}</code>\n🚀 Retrying bot…")
+    return True
+
 def monitor_and_guide_error(process, log_file_path, script_owner_id, file_name, message_obj_for_reply):
     """Watch a newly started process and give actionable error/log controls when it exits."""
     try:
@@ -1078,6 +1181,7 @@ def monitor_and_guide_error(process, log_file_path, script_owner_id, file_name, 
         time.sleep(3)
         return_code = process.poll()
         if return_code is None:
+            AUTO_INSTALL_STATE.pop(f"{int(script_owner_id)}_{file_name}", None)
             return
 
         try:
@@ -1099,6 +1203,16 @@ def monitor_and_guide_error(process, log_file_path, script_owner_id, file_name, 
         elif match_js:
             missing_module = match_js.group(1).split('/')[0].strip("'\"")
             manager = "npm"
+
+        # First try automatic installation. If it succeeds, restart the bot.
+        if missing_module:
+            try:
+                if _auto_install_missing_from_log(int(script_owner_id), file_name, log_file_path, message_obj_for_reply.chat.id):
+                    time.sleep(0.5)
+                    do_start_bot(int(script_owner_id), file_name, message_obj_for_reply)
+                    return
+            except Exception as auto_err:
+                logger.error("Automatic dependency install failed: %s", auto_err, exc_info=True)
 
         if missing_module:
             if manager == "pip":
@@ -1155,7 +1269,11 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
         custom_env = os.environ.copy()
         custom_env["PORT"] = str(unique_port)
         custom_env["PYTHONDONTWRITEBYTECODE"] = "1"
-        custom_env["PYTHONPATH"] = user_folder + (os.pathsep + os.environ.get("PYTHONPATH", "") if os.environ.get("PYTHONPATH") else "")
+        package_dir = os.path.join(user_folder, ".packages")
+        py_paths = [package_dir, user_folder]
+        if os.environ.get("PYTHONPATH"):
+            py_paths.append(os.environ.get("PYTHONPATH"))
+        custom_env["PYTHONPATH"] = os.pathsep.join(py_paths)
         custom_env["PYTHONUNBUFFERED"] = "1"
         custom_env["HOME"] = user_folder        
         custom_env["TEMP"] = user_folder        
@@ -1165,6 +1283,8 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
         process = subprocess.Popen([sys.executable, "-u", script_path], cwd=user_folder, stdout=log_file, stderr=log_file, stdin=subprocess.DEVNULL, env=custom_env, shell=False, start_new_session=True)
         
         bot_scripts[script_key] = {"process": process, "log_file": log_file, "file_name": file_name, "script_owner_id": script_owner_id, "start_time": datetime.now(), "warning_sent": False, "user_folder": user_folder, "type": "py"}
+        # Keep automatic dependency history while retrying crashes; it is cleared
+        # only when the process successfully stays started.
         bot.send_message(message_obj_for_reply.chat.id, f"🚀 **Python Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=False)
         threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply), daemon=True).start()
     except Exception as e:
@@ -1242,6 +1362,16 @@ def do_start_bot(owner_id, fname, message_obj, call_id=None):
     if is_bot_running(owner_id, fname):
         fail("This bot is already running.", alert=True)
         return False
+
+    # Automatically install declared dependencies before the first run.
+    # Failure is reported, but the bot can still be started so its runtime log
+    # can expose the exact missing package for the automatic retry system.
+    try:
+        declared = _install_declared_dependencies(owner_id, fname, chat_id)
+        if declared and any(not ok for _, ok, _ in declared):
+            logger.warning("Declared dependency installation had failures for %s/%s", owner_id, fname)
+    except Exception as dep_err:
+        logger.error("Declared dependency preflight failed: %s", dep_err, exc_info=True)
 
     if call_id:
         try:
