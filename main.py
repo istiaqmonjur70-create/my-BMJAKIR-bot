@@ -129,7 +129,7 @@ COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
     ["✨ 𝗨𝗽𝗱𝗮𝘁𝗲𝘀 𝗖𝗵𝗮𝗻𝗻𝗲𝗹 ✨", "🎥 𝗧𝘂𝘁𝗼𝗿𝗶𝗮𝗹"],
     ["🚀 𝗨𝗽𝗹𝗼𝗮𝗱 𝗙𝗶𝗹𝗲", "📁 𝗠𝗮𝗻𝗮𝗴𝗲 𝗙𝗶𝗹𝗲𝘀"],
     ["💎 𝗩𝗜𝗣 𝗣𝗹𝗮𝗻𝘀", "⚡ 𝗦𝗽𝗲𝗲𝗱 & 𝗣𝗶𝗻𝗴"],
-    ["👤 𝗔𝗰𝗰𝗼𝘂𝗻𝘁", "🔐 𝗦𝗲𝗰𝘂𝗿𝗶𝘁𝘆"],
+    ["👤 𝗔𝗰𝗰𝗼𝘂𝗻𝘁", "🛍️ 𝗦𝗵𝗼𝗽"],
     ["👑 𝗖𝗼𝗻𝘁𝗮𝗰𝘁 𝗢𝘄𝗻𝗲𝗿"],
 ]
 
@@ -138,7 +138,7 @@ ADMIN_COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
     ["🚀 𝗨𝗽𝗹𝗼𝗮𝗱 𝗙𝗶𝗹𝗲", "📁 𝗠𝗮𝗻𝗮𝗴𝗲 𝗙𝗶𝗹𝗲𝘀"],
     ["💎 𝗩𝗜𝗣 𝗣𝗹𝗮𝗻𝘀", "🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹"],
     ["⚡ 𝗦𝗽𝗲𝗲𝗱 & 𝗣𝗶𝗻𝗴", "📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀"],
-    ["👤 𝗔𝗰𝗰𝗼𝘂𝗻𝘁", "👑 𝗖𝗼𝗻𝘁𝗮𝗰𝘁 𝗢𝘄𝗻𝗲𝗿"],
+    ["👤 𝗔𝗰𝗰𝗼𝘂𝗻𝘁", "🛍️ 𝗦𝗵𝗼𝗽"],
 ]
 
 # --- Database Setup ---
@@ -205,6 +205,16 @@ def init_db():
                 plan_id INTEGER, 
                 end_time TIMESTAMP, 
                 notified_warning BOOLEAN DEFAULT 0
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS products (
+                product_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                logo_file_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                price INTEGER NOT NULL DEFAULT 0,
+                file_id TEXT NOT NULL,
+                file_name TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
 
             c.execute("INSERT OR IGNORE INTO admins (user_id, added_by) VALUES (?, ?)", (OWNER_ID, 0))
@@ -1072,8 +1082,7 @@ def _error_action_markup(owner_id, file_name, package_name=None):
     if package_name:
         markup.add(make_inline_button(f"📦 Install {package_name}", callback_data=f"botact_{token}_install", style="success"))
     markup.add(
-        make_inline_button("📄 View Logs", callback_data=f"botact_{token}_log", style="primary"),
-        make_inline_button("📋 Copy Full Log", callback_data=f"botact_{token}_copylog", style="primary")
+        make_inline_button("📄 View Logs", callback_data=f"botact_{token}_log", style="primary")
     )
     return markup
 
@@ -1439,6 +1448,91 @@ def add_active_user(user_id):
     except Exception as e:
         logger.error(f"Error adding active user: {e}")
 
+
+# --- Shop / Product Helpers ---
+product_setup = {}
+
+def _product_markup(product_id, is_admin=False):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(make_inline_button("🛒 Buy Now", callback_data=f"buy_product_{product_id}", style="success"))
+    if is_admin:
+        markup.add(
+            make_inline_button("✏️ Edit", callback_data=f"edit_product_{product_id}", style="primary"),
+            make_inline_button("🗑️ Delete", callback_data=f"delete_product_{product_id}", style="danger")
+        )
+    return markup
+
+def _get_products():
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            rows = conn.execute(
+                "SELECT product_id, logo_file_id, name, description, price, file_id, file_name "
+                "FROM products ORDER BY product_id DESC"
+            ).fetchall()
+            conn.close()
+            return rows
+    except Exception as e:
+        logger.error("Shop product read error: %s", e, exc_info=True)
+        return []
+
+def _get_product(product_id):
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            row = conn.execute(
+                "SELECT product_id, logo_file_id, name, description, price, file_id, file_name "
+                "FROM products WHERE product_id=?", (int(product_id),)
+            ).fetchone()
+            conn.close()
+            return row
+    except Exception as e:
+        logger.error("Product lookup error: %s", e, exc_info=True)
+        return None
+
+def _send_shop(chat_id, is_admin=False):
+    products = _get_products()
+    if not products:
+        bot.send_message(chat_id, "🛍️ <b>Shop</b>\n\nএখনো কোনো product যোগ করা হয়নি।", parse_mode="HTML")
+        return
+    bot.send_message(chat_id, f"🛍️ <b>Shop</b>\n\nমোট <b>{len(products)}</b>টি product available.", parse_mode="HTML")
+    for pid, logo_id, name, desc, price, file_id, file_name in products:
+        caption = (
+            f"🛍️ <b>{html_escape(name)}</b>\n\n"
+            f"{html_escape(desc) if desc else 'কোনো description দেওয়া হয়নি।'}\n\n"
+            f"💰 <b>Price:</b> {int(price)} BDT"
+        )
+        try:
+            bot.send_photo(chat_id, logo_id, caption=caption, parse_mode="HTML",
+                           reply_markup=_product_markup(pid, is_admin))
+        except Exception:
+            bot.send_message(chat_id, caption, parse_mode="HTML",
+                             reply_markup=_product_markup(pid, is_admin))
+
+def _product_admin_start(chat_id):
+    product_setup[chat_id] = {"step": "logo"}
+    bot.send_message(chat_id, "🛍️ <b>Add Product</b>\n\nপ্রথমে <b>Product Logo</b> হিসেবে একটি ছবি পাঠান।", parse_mode="HTML")
+
+def _product_save_and_finish(chat_id, data):
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            conn.execute(
+                "INSERT INTO products (logo_file_id,name,description,price,file_id,file_name) VALUES (?,?,?,?,?,?)",
+                (data["logo_file_id"], data["name"], data["description"], int(data["price"]),
+                 data["file_id"], data.get("file_name",""))
+            )
+            conn.commit()
+            conn.close()
+        product_setup.pop(chat_id, None)
+        bot.send_message(chat_id, f"✅ <b>Product added successfully!</b>\n\n🛍️ {html_escape(data['name'])}\n💰 {int(data['price'])} BDT",
+                         parse_mode="HTML")
+        _send_shop(chat_id, True)
+    except Exception as e:
+        logger.error("Product insert error: %s", e, exc_info=True)
+        bot.send_message(chat_id, "❌ Product save failed. আবার চেষ্টা করুন।")
+        product_setup.pop(chat_id, None)
+
 # --- UI Methods ---
 def create_reply_keyboard_main_menu(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -1462,7 +1556,7 @@ def create_admin_panel_inline(user_id):
         make_inline_button("➖ 𝗥𝗲𝗺𝗼𝘃𝗲 𝗖𝗵𝗮𝗻𝗻𝗲𝗹", callback_data="remove_channel")
     )
     markup.add(
-        make_inline_button("⚙️ 𝗦𝗲𝘁 𝗯𝗞𝗮𝘀𝗵 𝗡𝘂𝗺𝗯𝗲𝗿", callback_data="set_bkash"),
+        make_inline_button("⚙️ 𝗦𝗲𝘁 𝗯𝗞??𝘀𝗵 𝗡𝘂𝗺𝗯𝗲𝗿", callback_data="set_bkash"),
         make_inline_button("⚙️ 𝗦𝗲𝘁 𝗡𝗮𝗴𝗮𝗱 𝗡𝘂𝗺𝗯𝗲𝗿", callback_data="set_nagad")
     )
     markup.add(
@@ -1475,6 +1569,10 @@ def create_admin_panel_inline(user_id):
     )
     markup.add(
         make_inline_button("🎥 𝗦𝗲𝘁 𝗧𝘂𝘁𝗼𝗿𝗶𝗮𝗹", callback_data="set_tutorial")
+    )
+    markup.add(
+        make_inline_button("➕ 𝗔𝗱𝗱 𝗣𝗿𝗼𝗱𝘂𝗰𝘁", callback_data="add_product", style="success"),
+        make_inline_button("🗑️ 𝗗𝗲𝗹𝗲𝘁𝗲 𝗣𝗿𝗼𝗱𝘂𝗰𝘁", callback_data="delete_product_menu", style="danger")
     )
     
     core_admins = {int(OWNER_ID), int(globals().get("SECOND_ADMIN_ID", 0) or 0)}
@@ -1746,6 +1844,27 @@ def process_database_upload(message):
 @bot.message_handler(content_types=["document"])
 def handle_file_upload_doc(message):
     user_id = message.from_user.id
+    state = product_setup.get(message.chat.id)
+    if state and user_id in admin_ids and state.get("step") == "file":
+        doc = message.document
+        state["file_id"] = doc.file_id
+        state["file_name"] = getattr(doc, "file_name", "") or ""
+        if state.get("edit"):
+            with DB_LOCK:
+                conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+                conn.execute(
+                    "UPDATE products SET logo_file_id=?, name=?, description=?, price=?, file_id=?, file_name=? WHERE product_id=?",
+                    (state["logo_file_id"], state["name"], state["description"], int(state["price"]),
+                     state["file_id"], state["file_name"], int(state["product_id"]))
+                )
+                conn.commit()
+                conn.close()
+            product_setup.pop(message.chat.id, None)
+            bot.send_message(message.chat.id, "✅ <b>Product updated successfully!</b>", parse_mode="HTML")
+            _send_shop(message.chat.id, True)
+        else:
+            _product_save_and_finish(message.chat.id, state)
+        return
     doc_name = os.path.basename(getattr(message.document, "file_name", "") or "")
     if int(user_id) == int(globals().get("SECOND_ADMIN_ID", 0) or 0) and doc_name.lower().endswith((".db", ".sqlite", ".sqlite3")):
         process_database_upload(message); return
@@ -2244,6 +2363,104 @@ def handle_callbacks(call):
         elif data.startswith("copylog_"):
             _, owner_id, fname = data.split("_", 2)
             send_runtime_log(call.message.chat.id, int(owner_id), fname, call.id)
+            return
+
+        elif data == "add_product" and user_id in admin_ids:
+            bot.answer_callback_query(call.id)
+            _product_admin_start(call.message.chat.id)
+            return
+
+        elif data == "delete_product_menu" and user_id in admin_ids:
+            products = _get_products()
+            if not products:
+                bot.answer_callback_query(call.id, "No products found.", show_alert=True)
+                return
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            for p in products:
+                markup.add(make_inline_button(f"🗑️ {p[2]}", callback_data=f"delete_product_{p[0]}", style="danger"))
+            bot.answer_callback_query(call.id)
+            bot.send_message(call.message.chat.id, "🗑️ <b>Select a product to delete:</b>", reply_markup=markup, parse_mode="HTML")
+            return
+
+        elif data.startswith("delete_product_") and user_id in admin_ids:
+            pid = data[len("delete_product_"):]
+            product = _get_product(pid)
+            if not product:
+                bot.answer_callback_query(call.id, "Product not found.", show_alert=True)
+                return
+            with DB_LOCK:
+                conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+                conn.execute("DELETE FROM products WHERE product_id=?", (int(pid),))
+                conn.commit()
+                conn.close()
+            bot.answer_callback_query(call.id, "Product deleted successfully.", show_alert=True)
+            bot.send_message(call.message.chat.id, f"🗑️ <b>Deleted:</b> {html_escape(product[2])}", parse_mode="HTML")
+            return
+
+        elif data.startswith("buy_product_"):
+            pid = data[len("buy_product_"):]
+            product = _get_product(pid)
+            if not product:
+                bot.answer_callback_query(call.id, "Product not found.", show_alert=True)
+                return
+            price = int(product[4])
+            balance, _ = get_user_account(user_id)
+            if balance < price:
+                bot.answer_callback_query(call.id, "❌ Insufficient balance.", show_alert=True)
+                bot.send_message(call.message.chat.id,
+                                 f"❌ <b>Insufficient Balance</b>\n\n"
+                                 f"Product: <b>{html_escape(product[2])}</b>\n"
+                                 f"Price: <b>{price} BDT</b>\n"
+                                 f"Your balance: <b>{balance} BDT</b>\n\n"
+                                 f"Deposit করে আবার Buy Now চাপুন.",
+                                 parse_mode="HTML")
+                return
+            with DB_LOCK:
+                conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+                cur = conn.cursor()
+                cur.execute("SELECT balance FROM user_account WHERE user_id=?", (user_id,))
+                row = cur.fetchone()
+                current_balance = int(row[0]) if row else 0
+                if current_balance < price:
+                    conn.close()
+                    bot.answer_callback_query(call.id, "❌ Insufficient balance.", show_alert=True)
+                    return
+                cur.execute("UPDATE user_account SET balance=balance-? WHERE user_id=?", (price, user_id))
+                conn.commit()
+                conn.close()
+            try:
+                bot.send_document(call.message.chat.id, product[5],
+                                  caption=f"✅ <b>Purchase Successful!</b>\n\n"
+                                          f"🛍️ <b>{html_escape(product[2])}</b>\n"
+                                          f"💰 Paid: <b>{price} BDT</b>\n"
+                                          f"💳 Remaining Balance: <b>{current_balance-price} BDT</b>",
+                                  parse_mode="HTML")
+                bot.answer_callback_query(call.id, "✅ Purchased successfully!")
+            except Exception as e:
+                with DB_LOCK:
+                    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+                    conn.execute("UPDATE user_account SET balance=balance+? WHERE user_id=?", (price, user_id))
+                    conn.commit()
+                    conn.close()
+                logger.error("Product delivery failed: %s", e, exc_info=True)
+                bot.answer_callback_query(call.id, "Delivery failed. Your balance was refunded.", show_alert=True)
+            return
+
+        elif data.startswith("edit_product_") and user_id in admin_ids:
+            pid = data[len("edit_product_"):]
+            product = _get_product(pid)
+            if not product:
+                bot.answer_callback_query(call.id, "Product not found.", show_alert=True)
+                return
+            product_setup[call.message.chat.id] = {
+                "step": "edit_name", "product_id": int(pid),
+                "logo_file_id": product[1], "name": product[2],
+                "description": product[3], "price": product[4],
+                "file_id": product[5], "file_name": product[6],
+                "edit": True
+            }
+            bot.answer_callback_query(call.id)
+            bot.send_message(call.message.chat.id, "✏️ নতুন Product Name পাঠান।\nবর্তমান নাম: " + html_escape(product[2]), parse_mode="HTML")
             return
 
         elif data == "set_bkash" and user_id in admin_ids:
@@ -2763,6 +2980,12 @@ def _save_uploaded_media(message, kind):
 def handle_screenshot_upload(message):
     if message.from_user.id in blocked_users:
         return
+    state = product_setup.get(message.chat.id)
+    if state and message.from_user.id in admin_ids and state.get("step") == "logo":
+        state["logo_file_id"] = message.photo[-1].file_id
+        state["step"] = "name"
+        bot.send_message(message.chat.id, "📝 এখন <b>Product Name</b> পাঠান।", parse_mode="HTML")
+        return
     _save_uploaded_media(message, "photo")
 
 
@@ -2772,6 +2995,52 @@ def handle_video_upload(message):
         return
     _save_uploaded_media(message, "video")
 
+
+
+# --- Shop Product Name / Description / Price Workflow ---
+@bot.message_handler(func=lambda m: m.chat.id in product_setup and m.from_user.id in admin_ids)
+def handle_product_setup_text(message):
+    state = product_setup.get(message.chat.id)
+    if not state or not getattr(message, "text", None):
+        return
+    value = message.text.strip()
+    step = state.get("step")
+    if step == "name":
+        if not value:
+            bot.send_message(message.chat.id, "❌ Product Name খালি হতে পারবে না।")
+            return
+        state["name"] = value
+        state["step"] = "description"
+        bot.send_message(message.chat.id, "📝 এখন <b>Product Description</b> পাঠান।", parse_mode="HTML")
+    elif step == "description":
+        state["description"] = value
+        state["step"] = "price"
+        bot.send_message(message.chat.id, "💰 এখন <b>Product Price</b> BDT সংখ্যায় পাঠান।", parse_mode="HTML")
+    elif step == "price":
+        if not value.isdigit() or int(value) < 0:
+            bot.send_message(message.chat.id, "❌ সঠিক price দিন, শুধু সংখ্যা।")
+            return
+        state["price"] = int(value)
+        state["step"] = "file"
+        bot.send_message(message.chat.id, "📦 এখন <b>Product File</b> পাঠান। Buyer এই file-টাই পাবে।", parse_mode="HTML")
+    elif step == "edit_name":
+        if not value:
+            bot.send_message(message.chat.id, "❌ Product Name খালি হতে পারবে না।")
+            return
+        state["name"] = value
+        state["step"] = "edit_description"
+        bot.send_message(message.chat.id, "📝 নতুন Description পাঠান।", parse_mode="HTML")
+    elif step == "edit_description":
+        state["description"] = value
+        state["step"] = "edit_price"
+        bot.send_message(message.chat.id, "💰 নতুন Price পাঠান।", parse_mode="HTML")
+    elif step == "edit_price":
+        if not value.isdigit() or int(value) < 0:
+            bot.send_message(message.chat.id, "❌ সঠিক price দিন, শুধু সংখ্যা।")
+            return
+        state["price"] = int(value)
+        state["step"] = "file"
+        bot.send_message(message.chat.id, "📦 নতুন Product File পাঠান।", parse_mode="HTML")
 
 # --- Text Handler Mapping ---
 BUTTON_MAPPING = {
@@ -2783,15 +3052,7 @@ BUTTON_MAPPING = {
     "👤 𝗔𝗰𝗰𝗼𝘂𝗻𝘁": _logic_account,
     "⚡ 𝗦𝗽𝗲𝗲𝗱 & 𝗣𝗶𝗻𝗴": lambda m: bot.send_message(m.chat.id, "⚡ **Bot Latency:** `12 ms` (Server Active)"),
     "📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀": lambda m: bot.send_message(m.chat.id, f"📊 **Active Users:** `{len(active_users)}`\n🚀 **Running Bots:** `{len(bot_scripts)}`\n🚫 **Blocked Users:** `{len(blocked_users)}`", parse_mode="Markdown"),
-    "🔐 𝗦𝗲𝗰𝘂𝗿𝗶𝘁𝘆": lambda m: bot.send_message(
-        m.chat.id,
-        "🔐 **Premium Security Mode Active**\n\n"
-        "• Every upload requires admin approval\n"
-        "• One admin approval unlocks a file\n"
-        "• Automatic shell/CMD/package installation is disabled\n"
-        "• Pending files remain locked",
-        parse_mode="Markdown"
-    ),
+    "🛍️ 𝗦𝗵𝗼𝗽": lambda m: _send_shop(m.chat.id, m.from_user.id in admin_ids),
 }
 
 @bot.message_handler(func=lambda message: True)
