@@ -40,7 +40,7 @@ def keep_alive():
     print("Flask Keep-Alive server started.")
 
 # --- Configuration ---
-TOKEN = os.environ.get("BOT_TOKEN", "8975915610:AAFLQL6f53-YjErid8-vc5bU5KWtWRXYBFY").strip()
+TOKEN = os.environ.get("BOT_TOKEN", "8910223271:AAG4U3fDLzI8ONc5Wns8VMmXXyuXYyrp1d4").strip()
 OWNER_ID = 8814363793
 ADMIN_ID = 8814363793
 YOUR_USERNAME = "@DevCloudX"
@@ -3739,7 +3739,7 @@ def handle_text_messages(message):
 # Keep these values after the main code as requested.
 # Replace only the two placeholders below.
 # =====================================================================
-SECOND_BOT_TOKEN = os.environ.get("SECOND_BOT_TOKEN", "8910223271:AAFrFBCNTMaP7qTm_DFyvcyVk76lW2emYmM").strip()
+SECOND_BOT_TOKEN = os.environ.get("SECOND_BOT_TOKEN", 8910223271:AAG4U3fDLzI8ONc5Wns8VMmXXyuXYyrp1d4").strip()
 SECOND_ADMIN_ID = 8814363793
 
 APPROVAL_ADMIN_IDS = {int(OWNER_ID), int(ADMIN_ID)}
