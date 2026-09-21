@@ -40,7 +40,7 @@ def keep_alive():
     print("Flask Keep-Alive server started.")
 
 # --- Configuration ---
-TOKEN = os.environ.get("BOT_TOKEN", "8910223271:AAG9nVJ4F1rBi-qx2x00NBTqhisWRdbyMl0").strip()
+TOKEN = os.environ.get("BOT_TOKEN", "8992240546:AAGqeIwGB4eliixuwFi1aQt4xxezsC-qS2w").strip()
 OWNER_ID = 8814363793
 ADMIN_ID = 8814363793
 YOUR_USERNAME = "@DevCloudX"
