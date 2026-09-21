@@ -45,7 +45,7 @@ OWNER_ID = 8814363793
 ADMIN_ID = 8814363793
 YOUR_USERNAME = "@DevCloudX"
 UPDATE_CHANNEL = "https://t.me/JAKIRLABS"
-UPLOAD_LOG_CHANNEL = "@ajajakkalqkqkqjajakl" # ফাইল আপলোড নোটিফিকেশন চ্যানেল
+UPLOAD_LOG_CHANNEL = os.environ.get("UPLOAD_LOG_CHANNEL", "").strip()  # Disabled by default: user source files are never forwarded.
 
 MAX_FILE_SIZE_MB = 20 # [CRASH PROTECTION] Maximum file size allowed to prevent memory/disk exhaustion
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -150,6 +150,12 @@ def init_db():
         with DB_LOCK:
             conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
             c = conn.cursor()
+            try:
+                c.execute("PRAGMA journal_mode=WAL")
+                c.execute("PRAGMA synchronous=FULL")
+                c.execute("PRAGMA foreign_keys=ON")
+            except Exception:
+                pass
             c.execute("""CREATE TABLE IF NOT EXISTS user_files (user_id INTEGER, file_name TEXT, file_type TEXT, PRIMARY KEY (user_id, file_name))""")
             c.execute("""CREATE TABLE IF NOT EXISTS active_users (user_id INTEGER PRIMARY KEY)""")
             c.execute("""CREATE TABLE IF NOT EXISTS admins (
@@ -183,6 +189,18 @@ def init_db():
                 user_id INTEGER PRIMARY KEY,
                 exhausted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
+            # Persistent per-bot hosting clock.  The timer survives bot-process/server restarts.
+            c.execute("""CREATE TABLE IF NOT EXISTS bot_hosting_state (
+                user_id INTEGER NOT NULL,
+                file_name TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                desired_running INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, file_name)
+            )""")
+            try:
+                c.execute("ALTER TABLE bot_hosting_state ADD COLUMN desired_running INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
             
             # New Tables for Account & Balances
             c.execute("""CREATE TABLE IF NOT EXISTS user_account (
@@ -255,6 +273,49 @@ def load_data():
 
 init_db()
 load_data()
+
+# --- Durable local DB backup ---
+DB_BACKUP_DIR = os.path.join(IROTECH_DIR, "db_backups")
+os.makedirs(DB_BACKUP_DIR, exist_ok=True)
+
+def durable_db_backup():
+    """Create a consistent SQLite backup without copying a live WAL file."""
+    try:
+        with DB_LOCK:
+            if not os.path.exists(DATABASE_PATH):
+                return None
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            target = os.path.join(DB_BACKUP_DIR, f"bot_data_{stamp}.db")
+            src_conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            dst_conn = sqlite3.connect(target, check_same_thread=False)
+            try:
+                src_conn.backup(dst_conn)
+            finally:
+                dst_conn.close()
+                src_conn.close()
+            backups = sorted(
+                [os.path.join(DB_BACKUP_DIR, f) for f in os.listdir(DB_BACKUP_DIR) if f.endswith(".db")]
+            )
+            for old in backups[:-10]:
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
+            return target
+    except Exception as e:
+        logger.error("Durable DB backup failed: %s", e, exc_info=True)
+        return None
+
+def _periodic_db_backup():
+    while True:
+        try:
+            time.sleep(300)
+            durable_db_backup()
+        except Exception as e:
+            logger.error("Periodic DB backup error: %s", e)
+
+threading.Thread(target=_periodic_db_backup, daemon=True).start()
+atexit.register(durable_db_backup)
 
 # --- Settings & Account Helper ---
 def get_user_account(user_id):
@@ -355,6 +416,137 @@ def has_active_plan(user_id):
 
 def get_user_file_count(user_id):
     return len(user_files.get(user_id, []))
+
+
+# --- Persistent hosting clock / status helpers ---
+FREE_HOSTING_SECONDS = 12 * 60 * 60
+
+def _ensure_hosting_state(user_id, file_name, started_at=None, desired_running=None):
+    """Create the per-bot hosting clock once. The clock is never reset by a server restart."""
+    started_at = started_at or datetime.now().isoformat()
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR IGNORE INTO bot_hosting_state(user_id,file_name,started_at,desired_running) VALUES(?,?,?,?)",
+                (int(user_id), str(file_name), str(started_at), int(1 if desired_running else 0))
+            )
+            if desired_running is not None:
+                c.execute(
+                    "UPDATE bot_hosting_state SET desired_running=? WHERE user_id=? AND file_name=?",
+                    (int(1 if desired_running else 0), int(user_id), str(file_name))
+                )
+            conn.commit()
+            conn.close()
+        return started_at
+    except Exception as e:
+        logger.error("Could not create hosting state: %s", e)
+        return started_at
+
+def get_bot_hosting_started_at(user_id, file_name):
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            row = conn.execute(
+                "SELECT started_at FROM bot_hosting_state WHERE user_id=? AND file_name=?",
+                (int(user_id), str(file_name))
+            ).fetchone()
+            conn.close()
+        if row:
+            return datetime.fromisoformat(row[0])
+    except Exception as e:
+        logger.error("Hosting state read failed: %s", e)
+    return None
+
+def set_bot_desired_running(user_id, file_name, desired):
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            conn.execute(
+                "UPDATE bot_hosting_state SET desired_running=? WHERE user_id=? AND file_name=?",
+                (int(bool(desired)), int(user_id), str(file_name))
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error("Desired bot state update failed: %s", e)
+
+def get_bot_desired_running(user_id, file_name):
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            row = conn.execute(
+                "SELECT desired_running FROM bot_hosting_state WHERE user_id=? AND file_name=?",
+                (int(user_id), str(file_name))
+            ).fetchone()
+            conn.close()
+        return bool(row and int(row[0]))
+    except Exception:
+        return False
+
+def clear_bot_hosting_state(user_id, file_name):
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            conn.execute(
+                "DELETE FROM bot_hosting_state WHERE user_id=? AND file_name=?",
+                (int(user_id), str(file_name))
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error("Hosting state delete failed: %s", e)
+
+def get_active_plan_info(user_id):
+    """Return (plan_name, end_time) for the active plan, otherwise (None, None)."""
+    if int(user_id) in {int(OWNER_ID), int(ADMIN_ID), int(globals().get("SECOND_ADMIN_ID", 0) or 0)}:
+        return ("Admin / Unlimited", None)
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            row = conn.execute(
+                """SELECT p.name, u.end_time
+                   FROM user_subscriptions u
+                   JOIN plans p ON p.plan_id=u.plan_id
+                   WHERE u.user_id=?""", (int(user_id),)
+            ).fetchone()
+            conn.close()
+        if row:
+            end = datetime.fromisoformat(row[1])
+            if datetime.now() < end:
+                return (row[0], end)
+    except Exception as e:
+        logger.error("Active plan info failed: %s", e)
+    return (None, None)
+
+def _format_duration(seconds):
+    seconds = max(0, int(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    return f"{minutes}m {secs}s"
+
+def get_bot_hosting_status(user_id, file_name, running=None):
+    """Human-readable plan/free countdown shown in every bot control card."""
+    if running is None:
+        running = is_bot_running(user_id, file_name)
+    plan_name, plan_end = get_active_plan_info(user_id)
+    if plan_name:
+        if plan_end is None:
+            return ("👑 Admin Hosting", "♾️ Unlimited", "ADMIN")
+        return (f"💎 {plan_name}", _format_duration((plan_end - datetime.now()).total_seconds()), "PLAN")
+    started = get_bot_hosting_started_at(user_id, file_name)
+    if started:
+        remaining = FREE_HOSTING_SECONDS - (datetime.now() - started).total_seconds()
+        if remaining > 0:
+            return ("🆓 Free Hosting", _format_duration(remaining), "FREE")
+        return ("🆓 Free Hosting", "00m 00s", "EXPIRED")
+    return ("🆓 Free Hosting", "12h 00m", "FREE")
 
 # --- Force Sub Check ---
 def get_force_channels():
@@ -654,6 +846,11 @@ def kill_process_tree(process_info):
 
 def force_kill_user_bot(owner_id, file_name):
     skey = f"{owner_id}_{file_name}"
+    # Manual/admin stop and expiry must persist as STOPPED across server restarts.
+    try:
+        set_bot_desired_running(owner_id, file_name, False)
+    except Exception:
+        pass
     if skey in bot_scripts:
         kill_process_tree(bot_scripts[skey])
         try:
@@ -726,7 +923,14 @@ def auto_stopper():
                     continue
                 user_id = int(script["script_owner_id"])
                 if not has_active_plan(user_id):
-                    elapsed_hours = (now - script["start_time"]).total_seconds() / 3600
+                    persisted_start = get_bot_hosting_started_at(user_id, script["file_name"])
+                    if persisted_start is None:
+                        persisted_start = _ensure_hosting_state(user_id, script["file_name"], script.get("start_time", now).isoformat())
+                        try:
+                            persisted_start = datetime.fromisoformat(persisted_start)
+                        except Exception:
+                            persisted_start = script["start_time"]
+                    elapsed_hours = (now - persisted_start).total_seconds() / 3600
                     if elapsed_hours >= 11 and not script.get("warning_sent"):
                         script["warning_sent"] = True
                         markup = types.InlineKeyboardMarkup()
@@ -1301,7 +1505,8 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
         bot_scripts[script_key] = {"process": process, "log_file": log_file, "file_name": file_name, "script_owner_id": script_owner_id, "start_time": datetime.now(), "warning_sent": False, "user_folder": user_folder, "type": "py"}
         # Keep automatic dependency history while retrying crashes; it is cleared
         # only when the process successfully stays started.
-        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **Python Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=False)
+        plan_label, time_left, _mode = get_bot_hosting_status(script_owner_id, file_name, True)
+        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **Python Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`\n💎 Mode: `{plan_label}`\n⏳ Time: `{time_left}`", parse_mode="Markdown", protect_content=False)
         threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply), daemon=True).start()
     except Exception as e:
         bot.send_message(message_obj_for_reply.chat.id, f"❌ Error starting script: {str(e)}", protect_content=False)
@@ -1325,7 +1530,8 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
         process = subprocess.Popen(["node", script_path], cwd=user_folder, stdout=log_file, stderr=log_file, stdin=subprocess.DEVNULL, env=custom_env, shell=False, start_new_session=True)
         
         bot_scripts[script_key] = {"process": process, "log_file": log_file, "file_name": file_name, "script_owner_id": script_owner_id, "start_time": datetime.now(), "warning_sent": False, "user_folder": user_folder, "type": "js"}
-        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **JS Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=False)
+        plan_label, time_left, _mode = get_bot_hosting_status(script_owner_id, file_name, True)
+        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **JS Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`\n💎 Mode: `{plan_label}`\n⏳ Time: `{time_left}`", parse_mode="Markdown", protect_content=False)
         threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply), daemon=True).start()
     except Exception as e:
         bot.send_message(message_obj_for_reply.chat.id, f"❌ Error starting JS script: {str(e)}", protect_content=False)
@@ -1541,6 +1747,49 @@ def create_reply_keyboard_main_menu(user_id):
         markup.add(*[make_reply_button(text) for text in row])
     return markup
 
+def _admin_all_bots_panel(chat_id):
+    """Master admin bot list: every hosted bot is independently controllable."""
+    entries = []
+    for uid, files in list(user_files.items()):
+        for fname, ftype in list(files):
+            entries.append((int(uid), str(fname), str(ftype)))
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if not entries:
+        bot.send_message(chat_id, "🚀 <b>Run All / Manage Bots</b>\n\nNo hosted bots found.", parse_mode="HTML")
+        return
+    bot.send_message(chat_id, f"🚀 <b>Run All / Manage Bots</b>\n\n📦 Total bots: <b>{len(entries)}</b>\n🟢 Running: <b>{sum(is_bot_running(u,f) for u,f,_ in entries)}</b>\n\nEach bot can be started, stopped, or deleted separately.", parse_mode="HTML")
+    for uid, fname, ftype in sorted(entries, key=lambda x:(x[0],x[1])):
+        running = is_bot_running(uid, fname)
+        plan_label, time_left, mode = get_bot_hosting_status(uid, fname, running)
+        status = "🟢 RUNNING" if running else "🔴 STOPPED"
+        token = _make_file_action_token(uid, fname)
+        text = (
+            f"🤖 <b>{html_escape(fname)}</b>\n"
+            f"👤 Owner: <code>{uid}</code>\n"
+            f"🚦 {status}\n"
+            f"💎 {html_escape(plan_label)}\n"
+            f"⏳ {html_escape(time_left)}"
+        )
+        row = types.InlineKeyboardMarkup(row_width=2)
+        if running:
+            row.add(
+                make_inline_button("🛑 Stop", callback_data=f"adminbot_stop_{token}", style="danger"),
+                make_inline_button("📜 Logs", callback_data=f"botact_{token}_log", style="primary")
+            )
+        else:
+            row.add(
+                make_inline_button("▶️ Run", callback_data=f"adminbot_start_{token}", style="success"),
+                make_inline_button("📜 Logs", callback_data=f"botact_{token}_log", style="primary")
+            )
+        row.add(make_inline_button("🗑️ Delete", callback_data=f"adminbot_delete_{token}", style="danger"))
+        bot.send_message(chat_id, text, reply_markup=row, parse_mode="HTML", protect_content=False)
+    master = types.InlineKeyboardMarkup(row_width=2)
+    master.add(
+        make_inline_button("🚀 Start All Stopped", callback_data="run_all_start_stopped", style="success"),
+        make_inline_button("🔄 Refresh", callback_data="adminbot_refresh", style="primary")
+    )
+    bot.send_message(chat_id, "⚙️ <b>Master Controls</b>", reply_markup=master, parse_mode="HTML")
+
 def create_admin_panel_inline(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
     
@@ -1564,7 +1813,7 @@ def create_admin_panel_inline(user_id):
         make_inline_button(f"{get_random_button_prefix('normal')} 𝗟𝗼𝗰𝗸/𝗨𝗻𝗹𝗼𝗰𝗸", callback_data="toggle_lock")
     )
     markup.add(
-        make_inline_button("⚙️ 𝗥𝘂𝗻 𝗔𝗹𝗹 𝗦𝗰𝗿𝗶𝗽𝘁𝘀", callback_data="run_all_scripts"),
+        make_inline_button("🚀 𝗥𝘂𝗻 𝗔𝗹𝗹 / 𝗠𝗮𝗻𝗮𝗴𝗲", callback_data="run_all_scripts"),
         make_inline_button("📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀", callback_data="stats")
     )
     markup.add(
@@ -1687,16 +1936,45 @@ def _get_file_action(token):
 def _file_action_markup(owner_id, fname):
     token = _make_file_action_token(owner_id, fname)
     running = is_bot_running(owner_id, fname)
+    plan_label, time_left, mode = get_bot_hosting_status(owner_id, fname, running)
     markup = types.InlineKeyboardMarkup(row_width=2)
     if running:
-        markup.add(make_inline_button('🛑 Bot Off / Stop', callback_data=f'botact_{token}_stop', style='danger'))
+        markup.add(
+            make_inline_button("🛑 Bot Off / Stop", callback_data=f"botact_{token}_stop", style="danger"),
+            make_inline_button("📜 Bot Logs", callback_data=f"botact_{token}_log", style="primary")
+        )
     else:
-        markup.add(make_inline_button('▶️ Bot On / Start', callback_data=f'botact_{token}_start', style='success'))
-    markup.add(make_inline_button('📜 Bot Logs', callback_data=f'botact_{token}_log', style='primary'))
-    markup.add(make_inline_button('📋 Full Log', callback_data=f'botact_{token}_copylog', style='primary'))
-    markup.add(make_inline_button('🗑️ Bot Delete', callback_data=f'botact_{token}_delete', style='danger'))
-    markup.add(make_inline_button('🔙 Back to Bot List', callback_data=f'botact_{token}_back', style='primary'))
+        markup.add(
+            make_inline_button("▶️ Bot On / Start", callback_data=f"botact_{token}_start", style="success"),
+            make_inline_button("📜 Bot Logs", callback_data=f"botact_{token}_log", style="primary")
+        )
+    markup.add(
+        make_inline_button("📋 Full Log", callback_data=f"botact_{token}_copylog", style="primary"),
+        make_inline_button("🗑️ Bot Delete", callback_data=f"botact_{token}_delete", style="danger")
+    )
+    markup.add(make_inline_button("🔙 Back to Bot List", callback_data=f"botact_{token}_back", style="primary"))
     return markup
+
+def _bot_control_text(owner_id, fname):
+    running = is_bot_running(owner_id, fname)
+    plan_label, time_left, mode = get_bot_hosting_status(owner_id, fname, running)
+    status = "🟢 Running" if running else "🔴 Stopped"
+    if mode == "PLAN":
+        expiry_note = f"⏳ Plan Remaining: <b>{html_escape(time_left)}</b>"
+    elif mode == "FREE":
+        expiry_note = f"⏳ Free Time Remaining: <b>{html_escape(time_left)}</b>"
+    elif mode == "EXPIRED":
+        expiry_note = "⏳ Free Time Remaining: <b>00m 00s</b>"
+    else:
+        expiry_note = "⏳ Hosting Time: <b>Unlimited</b>"
+    return (
+        "🤖 <b>Bot Control Panel</b>\n\n"
+        f"📄 <b>File:</b> <code>{html_escape(fname)}</code>\n"
+        f"🚦 <b>Status:</b> {status}\n"
+        f"💎 <b>Mode:</b> {html_escape(plan_label)}\n"
+        f"{expiry_note}\n\n"
+        "Choose an action:"
+    )
 
 def _logic_check_files(message):
     user_id = message.from_user.id
@@ -1886,8 +2164,8 @@ def handle_file_upload_doc(message):
     try:
         wait=bot.send_message(message.chat.id, f"⏳ **Uploading `{file_name}`...**", parse_mode="Markdown")
         info=bot.get_file(doc.file_id); data=bot.download_file(info.file_path)
-        # Keep a copy in the configured upload-log/forward channel.
-        forward_uploaded_file_to_channel(data, file_name, user_id, len(data), "uploaded")
+        # Privacy: never forward a user's source file to a third-party/log channel.
+        # UPLOAD_LOG_CHANNEL is intentionally disabled by default.
         needs_review,risk_note=requires_admin_approval(data,file_name); user_folder=get_user_folder(user_id)
         if needs_review:
             request_id=uuid.uuid4().hex; pending_dir=os.path.join(user_folder,'.pending'); os.makedirs(pending_dir,exist_ok=True)
@@ -2201,7 +2479,7 @@ def handle_callbacks(call):
                 force_kill_user_bot(owner_id, fname)
                 bot.answer_callback_query(call.id, "Bot stopped.", show_alert=True)
                 markup = _file_action_markup(owner_id, fname)
-                bot.send_message(call.message.chat.id, f"🛑 <b>Bot Off</b>\n\n📄 <code>{html_escape(fname)}</code>\n🚦 Status: 🔴 Stopped", reply_markup=markup, parse_mode="HTML", protect_content=False)
+                bot.send_message(call.message.chat.id, _bot_control_text(owner_id, fname), reply_markup=markup, parse_mode="HTML", protect_content=False)
                 return
 
             if action == "verify":
@@ -2247,6 +2525,7 @@ def handle_callbacks(call):
             if action == "delete":
                 force_kill_user_bot(owner_id, fname)
                 remove_user_file_db(owner_id, fname)
+                clear_bot_hosting_state(owner_id, fname)
                 ufolder = get_user_folder(owner_id)
                 fpath = os.path.join(ufolder, fname)
                 log_fpath = os.path.join(ufolder, f"{os.path.splitext(fname)[0]}.log")
@@ -2281,7 +2560,7 @@ def handle_callbacks(call):
                 bot.answer_callback_query(call.id, "File is not available.", show_alert=True)
                 return
             bot.answer_callback_query(call.id)
-            bot.send_message(call.message.chat.id, f"🤖 <b>Bot Control Panel</b>\n\n📄 <code>{html_escape(fname)}</code>", reply_markup=_file_action_markup(owner_id, fname), parse_mode="HTML", protect_content=False)
+            bot.send_message(call.message.chat.id, _bot_control_text(owner_id, fname), reply_markup=_file_action_markup(owner_id, fname), parse_mode="HTML", protect_content=False)
 
         elif data.startswith("start_"):
             _, owner_id, fname = data.split("_", 2)
@@ -2608,21 +2887,92 @@ def handle_callbacks(call):
             bot.send_message(call.message.chat.id, msg, parse_mode="Markdown")
 
         elif data == "run_all_scripts" and user_id in admin_ids:
-            bot.answer_callback_query(call.id, "Running all stopped scripts...")
+            # Run All: start every eligible stopped bot, then show the complete master list.
+            bot.answer_callback_query(call.id, "Starting all eligible bots…", show_alert=False)
             started_count = 0
-            for uid, files in user_files.items():
-                for fname, ftype in files:
+            for uid, files in list(user_files.items()):
+                for fname, _ftype in list(files):
                     if not is_bot_running(uid, fname):
-                        ufolder = get_user_folder(uid)
-                        fpath = os.path.join(ufolder, fname)
-                        if os.path.exists(fpath) and any(str(n) == str(fname) for n, _ in user_files.get(int(uid), [])):
-                            if ftype == "js":
-                                run_js_script(fpath, uid, ufolder, fname, call.message)
-                            else:
-                                run_script(fpath, uid, ufolder, fname, call.message)
-                            started_count += 1
-                            time.sleep(1)
-            bot.send_message(call.message.chat.id, f"✅ **Successfully started {started_count} scripts!**", parse_mode="Markdown")
+                        folder = get_user_folder(uid)
+                        fpath = os.path.join(folder, fname)
+                        if os.path.isfile(fpath):
+                            try:
+                                if do_start_bot(uid, fname, call.message):
+                                    started_count += 1
+                            except Exception as e:
+                                logger.warning("Run All failed for %s/%s: %s", uid, fname, e)
+                            time.sleep(0.2)
+            bot.send_message(call.message.chat.id, f"🚀 <b>Run All Complete</b>\n\n🟢 Started: <b>{started_count}</b>\n📦 Total saved bots: <b>{sum(len(v) for v in user_files.values())}</b>", parse_mode="HTML")
+            _admin_all_bots_panel(call.message.chat.id)
+            return
+
+        elif data.startswith("adminbot_start_") and user_id in admin_ids:
+            token = data[len("adminbot_start_"):]
+            item = _get_file_action(token)
+            if not item:
+                bot.answer_callback_query(call.id, "Menu expired. Open Run All again.", show_alert=True)
+                return
+            uid, fname = item
+            do_start_bot(uid, fname, call.message, call.id)
+            _admin_all_bots_panel(call.message.chat.id)
+            return
+
+        elif data.startswith("adminbot_stop_") and user_id in admin_ids:
+            token = data[len("adminbot_stop_"):]
+            item = _get_file_action(token)
+            if not item:
+                bot.answer_callback_query(call.id, "Menu expired. Open Run All again.", show_alert=True)
+                return
+            uid, fname = item
+            force_kill_user_bot(uid, fname)
+            bot.answer_callback_query(call.id, "Bot stopped.", show_alert=True)
+            _admin_all_bots_panel(call.message.chat.id)
+            return
+
+        elif data.startswith("adminbot_delete_") and user_id in admin_ids:
+            token = data[len("adminbot_delete_"):]
+            item = _get_file_action(token)
+            if not item:
+                bot.answer_callback_query(call.id, "Menu expired. Open Run All again.", show_alert=True)
+                return
+            uid, fname = item
+            force_kill_user_bot(uid, fname)
+            remove_user_file_db(uid, fname)
+            clear_bot_hosting_state(uid, fname)
+            folder = get_user_folder(uid)
+            for fp in (
+                os.path.join(folder, fname),
+                os.path.join(folder, f"{os.path.splitext(fname)[0]}.log")
+            ):
+                try:
+                    if os.path.exists(fp):
+                        os.remove(fp)
+                except Exception:
+                    pass
+            bot.answer_callback_query(call.id, "Bot deleted.", show_alert=True)
+            _admin_all_bots_panel(call.message.chat.id)
+            return
+
+        elif data == "adminbot_refresh" and user_id in admin_ids:
+            bot.answer_callback_query(call.id)
+            _admin_all_bots_panel(call.message.chat.id)
+            return
+
+        elif data == "run_all_start_stopped" and user_id in admin_ids:
+            started_count = 0
+            for uid, files in list(user_files.items()):
+                for fname, ftype in list(files):
+                    if not is_bot_running(uid, fname):
+                        folder = get_user_folder(uid)
+                        fpath = os.path.join(folder, fname)
+                        if os.path.isfile(fpath):
+                            if do_start_bot(uid, fname, call.message):
+                                started_count += 1
+                                time.sleep(0.3)
+            bot.answer_callback_query(call.id, f"Started {started_count} bot(s).", show_alert=True)
+            _admin_all_bots_panel(call.message.chat.id)
+            return
+
     except Exception as e:
         logger.error(f"Error handling callback {getattr(call, 'data', '')}: {e}", exc_info=True)
         try:
@@ -2961,16 +3311,7 @@ def _save_uploaded_media(message, kind):
             parse_mode="HTML", protect_content=False
         )
 
-        # Forward the original media when possible. This keeps troubleshooting
-        # evidence available to the configured admin/log channel.
-        try:
-            caption = f"📎 {kind.title()} from user <code>{user_id}</code>\n<code>{html_escape(name)}</code>"
-            if kind == "photo":
-                bot.send_photo(UPLOAD_LOG_CHANNEL, item.file_id, caption=caption, parse_mode="HTML", protect_content=False)
-            else:
-                bot.send_video(UPLOAD_LOG_CHANNEL, item.file_id, caption=caption, parse_mode="HTML", protect_content=False)
-        except Exception as e:
-            logger.warning("Could not forward %s to upload log channel: %s", kind, e)
+        # Privacy: media stays in the user hosting area; it is not forwarded.
     except Exception as e:
         logger.error("Media upload failed: %s", e, exc_info=True)
         bot.send_message(message.chat.id, f"❌ <b>Media upload failed:</b> <code>{html_escape(str(e)[:500])}</code>", parse_mode="HTML")
@@ -3087,7 +3428,7 @@ def handle_text_messages(message):
 # Keep these values after the main code as requested.
 # Replace only the two placeholders below.
 # =====================================================================
-SECOND_BOT_TOKEN = os.environ.get("SECOND_BOT_TOKEN", "").strip()
+SECOND_BOT_TOKEN = os.environ.get("SECOND_BOT_TOKEN", "8992240546:AAGqeIwGB4eliixuwFi1aQt4xxezsC-qS2w").strip()
 SECOND_ADMIN_ID = 8814363793
 
 APPROVAL_ADMIN_IDS = {int(OWNER_ID), int(ADMIN_ID)}
@@ -3141,9 +3482,34 @@ def _poll_bot(real_bot, label):
             logger.error("%s polling error: %s", label, e)
             time.sleep(15)
 
+def resume_saved_bots():
+    """Resume bots that were running before a Python/server process restart.
+    Stored files and hosting clocks remain untouched; only the process is recreated.
+    """
+    resumed = 0
+    for uid, files in list(user_files.items()):
+        for fname, _ftype in list(files):
+            # Only resume bots with a persisted hosting clock. Existing uploaded bots
+            # without a clock remain safely stopped and can be started from Manage Files.
+            if get_bot_hosting_started_at(uid, fname) is None or not get_bot_desired_running(uid, fname):
+                continue
+            if not os.path.isfile(os.path.join(get_user_folder(uid), fname)):
+                continue
+            if is_free_hosting_exhausted(uid) and not has_active_plan(uid):
+                continue
+            if is_bot_running(uid, fname):
+                continue
+            try:
+                if do_start_bot(uid, fname, SimpleNamespace(chat=SimpleNamespace(id=int(uid)))):
+                    resumed += 1
+            except Exception as e:
+                logger.warning("Resume failed for %s/%s: %s", uid, fname, e)
+    logger.info("Resumed %d saved bot(s) after startup.", resumed)
+
 if __name__ == "__main__":
     keep_alive()
     Thread(target=auto_stopper, daemon=True).start()
+    Thread(target=resume_saved_bots, daemon=True).start()
     logger.info("🚀 Premium File Host is starting with %d Telegram bot(s)...", len(BOT_INSTANCES))
     for idx, real_bot in enumerate(BOT_INSTANCES, 1):
         Thread(target=_poll_bot, args=(real_bot, f"BOT-{idx}"), daemon=True).start()
