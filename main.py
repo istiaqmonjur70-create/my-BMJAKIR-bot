@@ -208,22 +208,6 @@ def init_db():
                 balance INTEGER DEFAULT 0,
                 total_referrals INTEGER DEFAULT 0
             )""")
-            # Referral reward configuration. Rules are threshold based:
-            # the highest matching threshold is applied.
-            c.execute("""CREATE TABLE IF NOT EXISTS referral_time_rules (
-                threshold INTEGER PRIMARY KEY,
-                bonus_seconds INTEGER NOT NULL
-            )""")
-            c.execute("""CREATE TABLE IF NOT EXISTS referral_limit_rules (
-                threshold INTEGER PRIMARY KEY,
-                bot_limit INTEGER NOT NULL
-            )""")
-            c.execute("""CREATE TABLE IF NOT EXISTS referrals (
-                referred_user_id INTEGER PRIMARY KEY,
-                referrer_user_id INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )""")
-            c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_enabled', '0')")
             
             # VIP Plans Tables
             c.execute("""CREATE TABLE IF NOT EXISTS plans (
@@ -404,8 +388,7 @@ def get_user_file_limit(user_id):
             conn.close()
             
             if row is not None:
-                return max(int(row[0]), get_referral_limit(user_id))
-            return max(1, get_referral_limit(user_id))
+                return row[0]
     except Exception as e:
         logger.error(f"Error checking file limit: {e}")
         
@@ -435,152 +418,8 @@ def get_user_file_count(user_id):
     return len(user_files.get(user_id, []))
 
 
-# --- Referral rewards + persistent hosting clock / status helpers ---
+# --- Persistent hosting clock / status helpers ---
 FREE_HOSTING_SECONDS = 12 * 60 * 60
-
-def is_referral_enabled():
-    return get_setting("referral_enabled", "0") == "1"
-
-def _parse_reward_duration(value):
-    """Parse 5h, 1d, 90m, 3600s into seconds."""
-    text = str(value or "").strip().lower().replace(" ", "")
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd])", text)
-    if not m:
-        return None
-    amount = float(m.group(1))
-    unit = m.group(2)
-    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
-    seconds = int(amount * mult)
-    return seconds if seconds > 0 else None
-
-def get_referral_count(user_id):
-    try:
-        with DB_LOCK:
-            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            row = conn.execute("SELECT total_referrals FROM user_account WHERE user_id=?", (int(user_id),)).fetchone()
-            conn.close()
-        return int(row[0]) if row else 0
-    except Exception:
-        return 0
-
-def get_referral_time_bonus_seconds(user_id):
-    if not is_referral_enabled():
-        return 0
-    refs = get_referral_count(user_id)
-    try:
-        with DB_LOCK:
-            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            row = conn.execute(
-                "SELECT bonus_seconds FROM referral_time_rules WHERE threshold<=? ORDER BY threshold DESC LIMIT 1",
-                (refs,)
-            ).fetchone()
-            conn.close()
-        return int(row[0]) if row else 0
-    except Exception:
-        return 0
-
-def get_referral_limit(user_id):
-    """Return the highest configured absolute free bot limit unlocked by referrals."""
-    if not is_referral_enabled():
-        return 1
-    refs = get_referral_count(user_id)
-    try:
-        with DB_LOCK:
-            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            row = conn.execute(
-                "SELECT bot_limit FROM referral_limit_rules WHERE threshold<=? ORDER BY threshold DESC LIMIT 1",
-                (refs,)
-            ).fetchone()
-            conn.close()
-        return max(1, int(row[0])) if row else 1
-    except Exception:
-        return 1
-
-def get_user_free_hosting_seconds(user_id):
-    return FREE_HOSTING_SECONDS + get_referral_time_bonus_seconds(user_id)
-
-def get_referral_rules():
-    try:
-        with DB_LOCK:
-            conn=sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            time_rules=conn.execute("SELECT threshold, bonus_seconds FROM referral_time_rules ORDER BY threshold").fetchall()
-            limit_rules=conn.execute("SELECT threshold, bot_limit FROM referral_limit_rules ORDER BY threshold").fetchall()
-            conn.close()
-        return time_rules, limit_rules
-    except Exception as e:
-        logger.error("Referral rules read failed: %s", e)
-        return [], []
-
-def _format_reward_seconds(seconds):
-    return _format_duration(seconds)
-
-def register_referral(referrer_id, referred_user_id):
-    """Register exactly one valid referral when the referral system is ON."""
-    if not is_referral_enabled():
-        return False
-    try:
-        referrer_id=int(referrer_id); referred_user_id=int(referred_user_id)
-        if referrer_id <= 0 or referred_user_id <= 0 or referrer_id == referred_user_id:
-            return False
-        with DB_LOCK:
-            conn=sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            c=conn.cursor()
-            c.execute("SELECT 1 FROM referrals WHERE referred_user_id=?", (referred_user_id,))
-            if c.fetchone():
-                conn.close()
-                return False
-            c.execute("INSERT OR IGNORE INTO user_account (user_id,balance,total_referrals) VALUES (?,0,0)", (referred_user_id,))
-            c.execute("INSERT OR IGNORE INTO user_account (user_id,balance,total_referrals) VALUES (?,0,0)", (referrer_id,))
-            c.execute("INSERT OR IGNORE INTO referrals (referred_user_id,referrer_user_id) VALUES (?,?)", (referred_user_id,referrer_id))
-            if c.rowcount == 1:
-                c.execute("UPDATE user_account SET total_referrals=total_referrals+1 WHERE user_id=?", (referrer_id,))
-                # A newly earned referral reward can extend/re-enable free hosting.
-                c.execute("DELETE FROM free_hosting_exhausted WHERE user_id=?", (referrer_id,))
-                conn.commit()
-                conn.close()
-                return True
-            conn.rollback(); conn.close()
-    except Exception as e:
-        logger.error("Referral registration failed: %s", e, exc_info=True)
-    return False
-
-def set_referral_time_rules(rules):
-    with DB_LOCK:
-        conn=sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c=conn.cursor(); c.execute("DELETE FROM referral_time_rules")
-        c.executemany("INSERT INTO referral_time_rules(threshold,bonus_seconds) VALUES(?,?)", rules)
-        conn.commit(); conn.close()
-
-def set_referral_limit_rules(rules):
-    with DB_LOCK:
-        conn=sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c=conn.cursor(); c.execute("DELETE FROM referral_limit_rules")
-        c.executemany("INSERT INTO referral_limit_rules(threshold,bot_limit) VALUES(?,?)", rules)
-        conn.commit(); conn.close()
-
-def referral_admin_text():
-    enabled = "🟢 ON" if is_referral_enabled() else "🔴 OFF"
-    tr, lr = get_referral_rules()
-    time_text = "\n".join(f"• {t} referral → +{_format_reward_seconds(sec)}" for t,sec in tr) or "• No time rules"
-    limit_text = "\n".join(f"• {t} referral → {lim} bot limit" for t,lim in lr) or "• No limit rules"
-    return (f"🎁 <b>Referral Reward System</b>\n\nStatus: <b>{enabled}</b>\n\n"
-            f"⏳ <b>Time Rules</b>\n{time_text}\n\n"
-            f"🤖 <b>Bot Limit Rules</b>\n{limit_text}\n\n"
-            "Rules are threshold based: the highest matched rule is used.")
-
-def referral_admin_markup():
-    m=types.InlineKeyboardMarkup(row_width=2)
-    m.add(
-        make_inline_button("🟢 ON / 🔴 OFF", callback_data="ref_toggle", style="primary"),
-        make_inline_button("⏳ Set Time Rules", callback_data="ref_set_time", style="success")
-    )
-    m.add(
-        make_inline_button("🤖 Set Limit Rules", callback_data="ref_set_limit", style="success"),
-        make_inline_button("👥 Referral Stats", callback_data="ref_stats", style="primary")
-    )
-    m.add(make_inline_button("🔄 Refresh", callback_data="ref_settings", style="primary"))
-    return m
-
 
 def _ensure_hosting_state(user_id, file_name, started_at=None, desired_running=None):
     """Create the per-bot hosting clock once. The clock is never reset by a server restart."""
@@ -703,11 +542,11 @@ def get_bot_hosting_status(user_id, file_name, running=None):
         return (f"💎 {plan_name}", _format_duration((plan_end - datetime.now()).total_seconds()), "PLAN")
     started = get_bot_hosting_started_at(user_id, file_name)
     if started:
-        remaining = get_user_free_hosting_seconds(user_id) - (datetime.now() - started).total_seconds()
+        remaining = FREE_HOSTING_SECONDS - (datetime.now() - started).total_seconds()
         if remaining > 0:
             return ("🆓 Free Hosting", _format_duration(remaining), "FREE")
         return ("🆓 Free Hosting", "00m 00s", "EXPIRED")
-    return ("🆓 Free Hosting", _format_duration(get_user_free_hosting_seconds(user_id)), "FREE")
+    return ("🆓 Free Hosting", "12h 00m", "FREE")
 
 # --- Force Sub Check ---
 def get_force_channels():
@@ -1091,9 +930,8 @@ def auto_stopper():
                             persisted_start = datetime.fromisoformat(persisted_start)
                         except Exception:
                             persisted_start = script["start_time"]
-                    free_limit_seconds = get_user_free_hosting_seconds(user_id)
-                    elapsed_seconds = (now - persisted_start).total_seconds()
-                    if elapsed_seconds >= max(0, free_limit_seconds - 3600) and not script.get("warning_sent"):
+                    elapsed_hours = (now - persisted_start).total_seconds() / 3600
+                    if elapsed_hours >= 11 and not script.get("warning_sent"):
                         script["warning_sent"] = True
                         markup = types.InlineKeyboardMarkup()
                         markup.add(make_inline_button(
@@ -1111,7 +949,7 @@ def auto_stopper():
                             )
                         except:
                             pass
-                    elif elapsed_seconds >= free_limit_seconds:
+                    elif elapsed_hours >= 12:
                         mark_free_hosting_exhausted(user_id)
                         force_kill_user_bot(user_id, script["file_name"])
                         try:
@@ -1737,8 +1575,8 @@ def do_start_bot(owner_id, fname, message_obj, call_id=None):
     if not has_active_plan(owner_id):
         existing = bot_scripts.get(f"{owner_id}_{fname}")
         if existing:
-            elapsed = (datetime.now() - existing["start_time"]).total_seconds()
-            if elapsed >= get_user_free_hosting_seconds(owner_id):
+            elapsed = (datetime.now() - existing["start_time"]).total_seconds() / 3600
+            if elapsed >= 12:
                 force_kill_user_bot(owner_id, fname)
                 fail("Free 12-hour limit reached. Buy a plan to continue.")
                 return False
@@ -1979,10 +1817,6 @@ def create_admin_panel_inline(user_id):
         make_inline_button("📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀", callback_data="stats")
     )
     markup.add(
-        make_inline_button("🎁 𝗥𝗲𝗳𝗲𝗿𝗿𝗮𝗹 𝗦𝘆𝘀𝘁𝗲𝗺", callback_data="ref_settings", style="success"),
-        make_inline_button("👥 𝗥𝗲𝗳𝗲𝗿𝗿𝗮𝗹 𝗦𝘁𝗮𝘁𝘀", callback_data="ref_stats", style="primary")
-    )
-    markup.add(
         make_inline_button("🎥 𝗦𝗲𝘁 𝗧𝘂𝘁𝗼𝗿𝗶𝗮𝗹", callback_data="set_tutorial")
     )
     markup.add(
@@ -2028,32 +1862,18 @@ def start_cmd(message):
 
         add_active_user(user_id)
         
-        is_new_user = False
         with DB_LOCK:
             conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
             c = conn.cursor()
             c.execute("SELECT user_id FROM user_account WHERE user_id=?", (user_id,))
-            is_new_user = c.fetchone() is None
-            if is_new_user:
+            if not c.fetchone():
                 c.execute("INSERT INTO user_account (user_id, balance, total_referrals) VALUES (?, 0, 0)", (user_id,))
-            conn.commit(); conn.close()
-
-        if is_new_user and len(args) > 1:
-            ref_id = args[1].strip()
-            if ref_id.isdigit() and int(ref_id) != user_id:
-                if register_referral(int(ref_id), user_id):
-                    try:
-                        ref_uid = int(ref_id)
-                        refs_now = get_referral_count(ref_uid)
-                        bonus = get_referral_time_bonus_seconds(ref_uid)
-                        limit_now = get_referral_limit(ref_uid)
-                        bot.send_message(ref_uid,
-                            f"🎉 <b>New Referral!</b>\n\n👤 User: <code>{user_id}</code>\n"
-                            f"👥 Total Referrals: <b>{refs_now}</b>\n"
-                            f"⏳ Referral Time Bonus: <b>+{_format_duration(bonus)}</b>\n"
-                            f"🤖 Referral Bot Limit: <b>{limit_now}</b>", parse_mode="HTML")
-                    except Exception:
-                        pass
+                if len(args) > 1:
+                    ref_id = args[1]
+                    if ref_id.isdigit() and int(ref_id) != user_id:
+                        c.execute("UPDATE user_account SET total_referrals = total_referrals + 1 WHERE user_id=?", (int(ref_id),))
+            conn.commit()
+            conn.close()
 
         limit = get_user_file_limit(user_id)
         is_vip = is_vip_user(user_id)
@@ -2227,9 +2047,7 @@ def _logic_account(message):
         f"💰 **𝗕𝗮𝗹𝗮𝗻𝗰𝗲:** `{balance} BDT`\n"
         f"👥 **𝗧𝗼𝘁𝗮𝗹 𝗥𝗲𝗳𝗲𝗿𝗿𝗮𝗹𝘀:** `{refs}`\n"
         f"🔗 **𝗥𝗲𝗳𝗲𝗿𝗿𝗮𝗹 𝗟𝗶𝗻𝗸:**\n`{ref_link}`\n\n"
-        f"🎁 **Referral System:** `{'ON' if is_referral_enabled() else 'OFF'}`\n"
-        f"⏳ **Referral Time Bonus:** `+{_format_duration(get_referral_time_bonus_seconds(user_id))}`\n"
-        f"🤖 **Referral Bot Limit:** `{get_referral_limit(user_id)}`"
+        f"*(Note: রেফার করলে কোনো বোনাস থাকবে না)*"
     )
     markup = types.InlineKeyboardMarkup()
     markup.add(make_inline_button("💳 𝗗𝗲𝗽𝗼𝘀𝗶𝘁 (Add Money)", callback_data="deposit_init"))
@@ -2476,51 +2294,6 @@ def handle_callbacks(call):
         if data == "show_vip_plans":
             bot.answer_callback_query(call.id)
             _logic_vip_plans(call.message)
-            return
-
-        if data == "ref_settings" and user_id in admin_ids:
-            bot.answer_callback_query(call.id)
-            bot.send_message(call.message.chat.id, referral_admin_text(), reply_markup=referral_admin_markup(), parse_mode="HTML")
-            return
-
-        if data == "ref_toggle" and user_id in admin_ids:
-            enabled = not is_referral_enabled()
-            set_setting("referral_enabled", "1" if enabled else "0")
-            bot.answer_callback_query(call.id, "Referral system ON" if enabled else "Referral system OFF", show_alert=True)
-            bot.send_message(call.message.chat.id, referral_admin_text(), reply_markup=referral_admin_markup(), parse_mode="HTML")
-            return
-
-        if data == "ref_set_time" and user_id in admin_ids:
-            msg=bot.send_message(call.message.chat.id,
-                "⏳ <b>Set Referral Time Rules</b>\n\n"
-                "Format: <code>1=5h,2=1d,5=2d</code>\n"
-                "মানে: 1 referral = +5h, 2 = +1d, 5 = +2d.\n"
-                "আগের সব time rule নতুন সেট দিয়ে replace হবে.", parse_mode="HTML")
-            bot.register_next_step_handler(msg, process_set_referral_time_rules)
-            return
-
-        if data == "ref_set_limit" and user_id in admin_ids:
-            msg=bot.send_message(call.message.chat.id,
-                "🤖 <b>Set Referral Bot-Limit Rules</b>\n\n"
-                "Format: <code>5=2,10=3,20=5</code>\n"
-                "মানে: 5 referral হলে free bot limit 2, 10 হলে 3.\n"
-                "আগের সব limit rule নতুন সেট দিয়ে replace হবে.", parse_mode="HTML")
-            bot.register_next_step_handler(msg, process_set_referral_limit_rules)
-            return
-
-        if data == "ref_stats" and user_id in admin_ids:
-            try:
-                with DB_LOCK:
-                    conn=sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-                    total=conn.execute("SELECT COUNT(*) FROM referrals").fetchone()[0]
-                    top=conn.execute("SELECT referrer_user_id,total_referrals FROM user_account WHERE total_referrals>0 ORDER BY total_referrals DESC LIMIT 20").fetchall()
-                    conn.close()
-                lines=[f"👤 <code>{uid}</code> — <b>{count}</b> referrals" for uid,count in top]
-                text="📊 <b>Referral Statistics</b>\n\n"+f"Total recorded referrals: <b>{total}</b>\n\n"+("\n".join(lines) if lines else "No referrals yet.")
-                bot.answer_callback_query(call.id)
-                bot.send_message(call.message.chat.id,text,parse_mode="HTML")
-            except Exception as e:
-                bot.answer_callback_query(call.id,"Could not load stats.",show_alert=True)
             return
 
         if data == "db_download" and int(user_id) == int(globals().get("SECOND_ADMIN_ID", 0) or 0):
@@ -3344,45 +3117,6 @@ def process_give_plan_userid(message):
     except Exception as e:
         bot.send_message(message.chat.id, "❌ ভুল User ID!")
 
-# --- Referral Admin Process Handlers ---
-def process_set_referral_time_rules(message):
-    try:
-        raw=message.text.strip()
-        rules=[]
-        for item in raw.split(","):
-            if not item.strip(): continue
-            if "=" not in item: raise ValueError
-            threshold_s,duration_s=[x.strip() for x in item.split("=",1)]
-            threshold=int(threshold_s)
-            if threshold < 1: raise ValueError
-            seconds=_parse_reward_duration(duration_s)
-            if seconds is None: raise ValueError
-            rules.append((threshold,seconds))
-        rules=sorted({t:(t,s) for t,s in rules}.values(), key=lambda x:x[0])
-        if not rules: raise ValueError
-        set_referral_time_rules(rules)
-        bot.send_message(message.chat.id, "✅ <b>Referral time rules updated.</b>\n\n"+referral_admin_text(), reply_markup=referral_admin_markup(), parse_mode="HTML")
-    except Exception:
-        bot.send_message(message.chat.id, "❌ ভুল format. উদাহরণ: <code>1=5h,2=1d,5=2d</code>", parse_mode="HTML")
-
-def process_set_referral_limit_rules(message):
-    try:
-        raw=message.text.strip()
-        rules=[]
-        for item in raw.split(","):
-            if not item.strip(): continue
-            if "=" not in item: raise ValueError
-            threshold_s,limit_s=[x.strip() for x in item.split("=",1)]
-            threshold=int(threshold_s); limit=int(limit_s)
-            if threshold < 1 or limit < 1: raise ValueError
-            rules.append((threshold,limit))
-        rules=sorted({t:(t,l) for t,l in rules}.values(), key=lambda x:x[0])
-        if not rules: raise ValueError
-        set_referral_limit_rules(rules)
-        bot.send_message(message.chat.id, "✅ <b>Referral bot-limit rules updated.</b>\n\n"+referral_admin_text(), reply_markup=referral_admin_markup(), parse_mode="HTML")
-    except Exception:
-        bot.send_message(message.chat.id, "❌ ভুল format. উদাহরণ: <code>5=2,10=3,20=5</code>", parse_mode="HTML")
-
 # --- Other Admin Process Handlers ---
 def process_set_tutorial_link(message):
     try:
@@ -3694,7 +3428,7 @@ def handle_text_messages(message):
 # Keep these values after the main code as requested.
 # Replace only the two placeholders below.
 # =====================================================================
-SECOND_BOT_TOKEN = os.environ.get("SECOND_BOT_TOKEN", "8975915610:AAFyMVM5vFyfWNurx-uUKaEj3bU_zC2LUPU").strip()
+SECOND_BOT_TOKEN = os.environ.get("SECOND_BOT_TOKEN", "8992240546:AAGqeIwGB4eliixuwFi1aQt4xxezsC-qS2w").strip()
 SECOND_ADMIN_ID = 8814363793
 
 APPROVAL_ADMIN_IDS = {int(OWNER_ID), int(ADMIN_ID)}
