@@ -45,7 +45,7 @@ OWNER_ID = 8814363793
 ADMIN_ID = 8814363793
 YOUR_USERNAME = "@DevCloudX"
 UPDATE_CHANNEL = "https://t.me/JAKIRLABS"
-UPLOAD_LOG_CHANNEL = os.environ.get("UPLOAD_LOG_CHANNEL", "@ajajakkalqkqkqjajakl").strip()  # Disabled by default: user source files are never forwarded.
+UPLOAD_LOG_CHANNEL = os.environ.get("UPLOAD_LOG_CHANNEL", "").strip()  # Disabled by default: user source files are never forwarded.
 
 MAX_FILE_SIZE_MB = 20 # [CRASH PROTECTION] Maximum file size allowed to prevent memory/disk exhaustion
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
