@@ -27,7 +27,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "8857119494:AAGYkDTV_PryJXECYPiRwbrEuOU3vDP6d
 
 # Example:
 # https://your-domain.com
-BASE_URL = os.getenv("BASE_URL", "https://your-domain.com")
+BASE_URL = os.getenv("BASE_URL", "https://my-bmjakir-bot-1.onrender.com")
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8814363793"))
 
