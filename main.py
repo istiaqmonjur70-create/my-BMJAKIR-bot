@@ -12,6 +12,8 @@ import threading
 import time
 import hashlib
 import uuid
+import ast
+import json
 from flask import Flask
 from threading import Thread
 import psutil
@@ -40,16 +42,12 @@ def keep_alive():
     print("Flask Keep-Alive server started.")
 
 # --- Configuration ---
-TOKEN = os.environ.get("BOT_TOKEN", "8910223271:AAF4edYH15Mdn5uGHQpHi3VXSKS7NLe90IU").strip()
+TOKEN = os.environ.get("BOT_TOKEN", "8741031738:AAHNwlVXskxpBkmriHsqZeYc8jVnKuBR4No").strip()
 OWNER_ID = 8814363793
 ADMIN_ID = 8814363793
 YOUR_USERNAME = "@DevCloudX"
 UPDATE_CHANNEL = "https://t.me/JAKIRLABS"
-# Private upload-log channel. Telegram Bot API needs the channel @username or numeric
-# chat ID (-1003953591957); a private invite link (+...) is NOT a valid send target.
-# Set UPLOAD_LOG_CHANNEL to the numeric chat ID in Render/Replit environment variables.
-UPLOAD_LOG_CHANNEL = os.environ.get("UPLOAD_LOG_CHANNEL", "-1003953591957").strip()
-UPLOAD_LOG_INVITE = "@jakakshhal"
+UPLOAD_LOG_CHANNEL = "-1003953591957"  # File upload log channel (bot must be admin)
 
 MAX_FILE_SIZE_MB = 20 # [CRASH PROTECTION] Maximum file size allowed to prevent memory/disk exhaustion
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -62,7 +60,7 @@ DEFAULT_NAGAD = "Off"
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, "upload_bots")
 IROTECH_DIR = os.path.join(BASE_DIR, "inf")
-DATABASE_PATH = os.path.join(IROTECH_DIR, "bot_data.db")
+DATABASE_PATH = os.path.join(IROTECH_DIR, "bot_data_owner_8814363793.db")
 
 # Create necessary directories
 os.makedirs(UPLOAD_BOTS_DIR, exist_ok=True)
@@ -111,6 +109,24 @@ class BotProxy:
 
 bot = BotProxy()
 
+# --- Safe Telegram callback acknowledgement ---
+# Telegram callback queries expire quickly. Old buttons may return 400; never let
+# that harmless condition crash/traceback the callback handler.
+def safe_answer_callback_query(callback_id, text="", show_alert=False):
+    try:
+        bot.answer_callback_query(callback_id, text, show_alert=show_alert)
+    except telebot.apihelper.ApiTelegramException as e:
+        msg = str(e)
+        if "query is too old" in msg or "response timeout expired" in msg or "query ID is invalid" in msg:
+            logger.debug("Ignoring expired callback query: %s", callback_id)
+            return False
+        logger.warning("Callback acknowledgement failed: %s", e)
+        return False
+    except Exception as e:
+        logger.debug("Callback acknowledgement failed: %s", e)
+        return False
+    return True
+
 # --- Data structures ---
 bot_scripts = {}
 user_files = {}
@@ -118,8 +134,13 @@ user_files = {}
 # even when uploaded filenames are long or contain underscores.
 FILE_ACTION_MAP = {}
 FILE_ACTION_LOCK = threading.Lock()
+UPLOAD_LOCKS = {}
+UPLOAD_LOCKS_GUARD = threading.Lock()
+# Project creation/update sessions: chat_id -> {step, project_name, old_file}
+PROJECT_STATES = {}
+PROJECT_STATES_LOCK = threading.Lock()
 active_users = set()
-admin_ids = {ADMIN_ID, OWNER_ID}
+admin_ids = {int(OWNER_ID)}
 blocked_users = set()
 bot_locked = False
 temp_deposit = {} # Temporary store for deposit steps
@@ -154,13 +175,17 @@ def init_db():
         with DB_LOCK:
             conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
             c = conn.cursor()
-            try:
-                c.execute("PRAGMA journal_mode=WAL")
-                c.execute("PRAGMA synchronous=FULL")
-                c.execute("PRAGMA foreign_keys=ON")
-            except Exception:
-                pass
             c.execute("""CREATE TABLE IF NOT EXISTS user_files (user_id INTEGER, file_name TEXT, file_type TEXT, PRIMARY KEY (user_id, file_name))""")
+            c.execute("""CREATE TABLE IF NOT EXISTS projects (
+                project_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                project_name TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_type TEXT DEFAULT 'py',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, project_name)
+            )""")
             c.execute("""CREATE TABLE IF NOT EXISTS active_users (user_id INTEGER PRIMARY KEY)""")
             c.execute("""CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
@@ -189,22 +214,22 @@ def init_db():
             )""")
             c.execute("""CREATE INDEX IF NOT EXISTS idx_pending_uploads_user
                          ON pending_uploads(user_id, status)""")
+            try:
+                c.execute("ALTER TABLE pending_uploads ADD COLUMN project_name TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
             c.execute("""CREATE TABLE IF NOT EXISTS free_hosting_exhausted (
                 user_id INTEGER PRIMARY KEY,
                 exhausted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
-            # Persistent per-bot hosting clock.  The timer survives bot-process/server restarts.
-            c.execute("""CREATE TABLE IF NOT EXISTS bot_hosting_state (
-                user_id INTEGER NOT NULL,
-                file_name TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                desired_running INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (user_id, file_name)
+            c.execute("""CREATE TABLE IF NOT EXISTS project_hosting (
+                project_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, expires_at TEXT,
+                last_notice TEXT DEFAULT '', ad_verified_at TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
-            try:
-                c.execute("ALTER TABLE bot_hosting_state ADD COLUMN desired_running INTEGER NOT NULL DEFAULT 0")
-            except sqlite3.OperationalError:
-                pass
+            c.execute("""CREATE TABLE IF NOT EXISTS ad_claim_tokens (
+                token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, project_name TEXT NOT NULL,
+                action TEXT NOT NULL DEFAULT 'deploy', created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used INTEGER DEFAULT 0
+            )""")
             
             # New Tables for Account & Balances
             c.execute("""CREATE TABLE IF NOT EXISTS user_account (
@@ -212,22 +237,6 @@ def init_db():
                 balance INTEGER DEFAULT 0,
                 total_referrals INTEGER DEFAULT 0
             )""")
-            # Referral reward configuration. Rules are threshold based:
-            # the highest matching threshold is applied.
-            c.execute("""CREATE TABLE IF NOT EXISTS referral_time_rules (
-                threshold INTEGER PRIMARY KEY,
-                bonus_seconds INTEGER NOT NULL
-            )""")
-            c.execute("""CREATE TABLE IF NOT EXISTS referral_limit_rules (
-                threshold INTEGER PRIMARY KEY,
-                bot_limit INTEGER NOT NULL
-            )""")
-            c.execute("""CREATE TABLE IF NOT EXISTS referrals (
-                referred_user_id INTEGER PRIMARY KEY,
-                referrer_user_id INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )""")
-            c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_enabled', '0')")
             
             # VIP Plans Tables
             c.execute("""CREATE TABLE IF NOT EXISTS plans (
@@ -254,10 +263,17 @@ def init_db():
                 file_name TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
+            try:
+                c.execute("ALTER TABLE products ADD COLUMN display_order INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+            # Give old products a stable serial order.
+            c.execute("UPDATE products SET display_order=product_id WHERE display_order IS NULL OR display_order=0")
 
-            c.execute("INSERT OR IGNORE INTO admins (user_id, added_by) VALUES (?, ?)", (OWNER_ID, 0))
-            if ADMIN_ID != OWNER_ID:
-                c.execute("INSERT OR IGNORE INTO admins (user_id, added_by) VALUES (?, ?)", (ADMIN_ID, 0))
+            # SECURITY: this installation has exactly one administrator.
+            # Any legacy/stale admin rows in a restored/copied DB are revoked.
+            c.execute("DELETE FROM admins WHERE user_id != ?", (int(OWNER_ID),))
+            c.execute("INSERT OR REPLACE INTO admins (user_id, added_by) VALUES (?, ?)", (int(OWNER_ID), 0))
 
             conn.commit()
             conn.close()
@@ -281,8 +297,9 @@ def load_data():
             c.execute("SELECT user_id FROM active_users")
             active_users.update(user_id for (user_id,) in c.fetchall())
 
-            c.execute("SELECT user_id FROM admins")
-            admin_ids.update(user_id for (user_id,) in c.fetchall())
+            # Never trust administrator IDs stored in the database.
+            admin_ids.clear()
+            admin_ids.add(int(OWNER_ID))
 
             c.execute("SELECT user_id FROM blocked_users")
             blocked_users.update(user_id for (user_id,) in c.fetchall())
@@ -293,49 +310,6 @@ def load_data():
 
 init_db()
 load_data()
-
-# --- Durable local DB backup ---
-DB_BACKUP_DIR = os.path.join(IROTECH_DIR, "db_backups")
-os.makedirs(DB_BACKUP_DIR, exist_ok=True)
-
-def durable_db_backup():
-    """Create a consistent SQLite backup without copying a live WAL file."""
-    try:
-        with DB_LOCK:
-            if not os.path.exists(DATABASE_PATH):
-                return None
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            target = os.path.join(DB_BACKUP_DIR, f"bot_data_{stamp}.db")
-            src_conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            dst_conn = sqlite3.connect(target, check_same_thread=False)
-            try:
-                src_conn.backup(dst_conn)
-            finally:
-                dst_conn.close()
-                src_conn.close()
-            backups = sorted(
-                [os.path.join(DB_BACKUP_DIR, f) for f in os.listdir(DB_BACKUP_DIR) if f.endswith(".db")]
-            )
-            for old in backups[:-10]:
-                try:
-                    os.remove(old)
-                except Exception:
-                    pass
-            return target
-    except Exception as e:
-        logger.error("Durable DB backup failed: %s", e, exc_info=True)
-        return None
-
-def _periodic_db_backup():
-    while True:
-        try:
-            time.sleep(300)
-            durable_db_backup()
-        except Exception as e:
-            logger.error("Periodic DB backup error: %s", e)
-
-threading.Thread(target=_periodic_db_backup, daemon=True).start()
-atexit.register(durable_db_backup)
 
 # --- Settings & Account Helper ---
 def get_user_account(user_id):
@@ -408,8 +382,7 @@ def get_user_file_limit(user_id):
             conn.close()
             
             if row is not None:
-                return max(int(row[0]), get_referral_limit(user_id))
-            return max(1, get_referral_limit(user_id))
+                return row[0]
     except Exception as e:
         logger.error(f"Error checking file limit: {e}")
         
@@ -437,281 +410,6 @@ def has_active_plan(user_id):
 
 def get_user_file_count(user_id):
     return len(user_files.get(user_id, []))
-
-
-# --- Referral rewards + persistent hosting clock / status helpers ---
-FREE_HOSTING_SECONDS = 12 * 60 * 60
-
-def is_referral_enabled():
-    return get_setting("referral_enabled", "0") == "1"
-
-def _parse_reward_duration(value):
-    """Parse 5h, 1d, 90m, 3600s into seconds."""
-    text = str(value or "").strip().lower().replace(" ", "")
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd])", text)
-    if not m:
-        return None
-    amount = float(m.group(1))
-    unit = m.group(2)
-    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
-    seconds = int(amount * mult)
-    return seconds if seconds > 0 else None
-
-def get_referral_count(user_id):
-    try:
-        with DB_LOCK:
-            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            row = conn.execute("SELECT total_referrals FROM user_account WHERE user_id=?", (int(user_id),)).fetchone()
-            conn.close()
-        return int(row[0]) if row else 0
-    except Exception:
-        return 0
-
-def get_referral_time_bonus_seconds(user_id):
-    if not is_referral_enabled():
-        return 0
-    refs = get_referral_count(user_id)
-    try:
-        with DB_LOCK:
-            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            row = conn.execute(
-                "SELECT bonus_seconds FROM referral_time_rules WHERE threshold<=? ORDER BY threshold DESC LIMIT 1",
-                (refs,)
-            ).fetchone()
-            conn.close()
-        return int(row[0]) if row else 0
-    except Exception:
-        return 0
-
-def get_referral_limit(user_id):
-    """Return the highest configured absolute free bot limit unlocked by referrals."""
-    if not is_referral_enabled():
-        return 1
-    refs = get_referral_count(user_id)
-    try:
-        with DB_LOCK:
-            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            row = conn.execute(
-                "SELECT bot_limit FROM referral_limit_rules WHERE threshold<=? ORDER BY threshold DESC LIMIT 1",
-                (refs,)
-            ).fetchone()
-            conn.close()
-        return max(1, int(row[0])) if row else 1
-    except Exception:
-        return 1
-
-def get_user_free_hosting_seconds(user_id):
-    return FREE_HOSTING_SECONDS + get_referral_time_bonus_seconds(user_id)
-
-def get_referral_rules():
-    try:
-        with DB_LOCK:
-            conn=sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            time_rules=conn.execute("SELECT threshold, bonus_seconds FROM referral_time_rules ORDER BY threshold").fetchall()
-            limit_rules=conn.execute("SELECT threshold, bot_limit FROM referral_limit_rules ORDER BY threshold").fetchall()
-            conn.close()
-        return time_rules, limit_rules
-    except Exception as e:
-        logger.error("Referral rules read failed: %s", e)
-        return [], []
-
-def _format_reward_seconds(seconds):
-    return _format_duration(seconds)
-
-def register_referral(referrer_id, referred_user_id):
-    """Register exactly one valid referral when the referral system is ON."""
-    if not is_referral_enabled():
-        return False
-    try:
-        referrer_id=int(referrer_id); referred_user_id=int(referred_user_id)
-        if referrer_id <= 0 or referred_user_id <= 0 or referrer_id == referred_user_id:
-            return False
-        with DB_LOCK:
-            conn=sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            c=conn.cursor()
-            c.execute("SELECT 1 FROM referrals WHERE referred_user_id=?", (referred_user_id,))
-            if c.fetchone():
-                conn.close()
-                return False
-            c.execute("INSERT OR IGNORE INTO user_account (user_id,balance,total_referrals) VALUES (?,0,0)", (referred_user_id,))
-            c.execute("INSERT OR IGNORE INTO user_account (user_id,balance,total_referrals) VALUES (?,0,0)", (referrer_id,))
-            c.execute("INSERT OR IGNORE INTO referrals (referred_user_id,referrer_user_id) VALUES (?,?)", (referred_user_id,referrer_id))
-            if c.rowcount == 1:
-                c.execute("UPDATE user_account SET total_referrals=total_referrals+1 WHERE user_id=?", (referrer_id,))
-                # A newly earned referral reward can extend/re-enable free hosting.
-                c.execute("DELETE FROM free_hosting_exhausted WHERE user_id=?", (referrer_id,))
-                conn.commit()
-                conn.close()
-                return True
-            conn.rollback(); conn.close()
-    except Exception as e:
-        logger.error("Referral registration failed: %s", e, exc_info=True)
-    return False
-
-def set_referral_time_rules(rules):
-    with DB_LOCK:
-        conn=sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c=conn.cursor(); c.execute("DELETE FROM referral_time_rules")
-        c.executemany("INSERT INTO referral_time_rules(threshold,bonus_seconds) VALUES(?,?)", rules)
-        conn.commit(); conn.close()
-
-def set_referral_limit_rules(rules):
-    with DB_LOCK:
-        conn=sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c=conn.cursor(); c.execute("DELETE FROM referral_limit_rules")
-        c.executemany("INSERT INTO referral_limit_rules(threshold,bot_limit) VALUES(?,?)", rules)
-        conn.commit(); conn.close()
-
-def referral_admin_text():
-    enabled = "🟢 ON" if is_referral_enabled() else "🔴 OFF"
-    tr, lr = get_referral_rules()
-    time_text = "\n".join(f"• {t} referral → +{_format_reward_seconds(sec)}" for t,sec in tr) or "• No time rules"
-    limit_text = "\n".join(f"• {t} referral → {lim} bot limit" for t,lim in lr) or "• No limit rules"
-    return (f"🎁 <b>Referral Reward System</b>\n\nStatus: <b>{enabled}</b>\n\n"
-            f"⏳ <b>Time Rules</b>\n{time_text}\n\n"
-            f"🤖 <b>Bot Limit Rules</b>\n{limit_text}\n\n"
-            "Rules are threshold based: the highest matched rule is used.")
-
-def referral_admin_markup():
-    m=types.InlineKeyboardMarkup(row_width=2)
-    m.add(
-        make_inline_button("🟢 ON / 🔴 OFF", callback_data="ref_toggle", style="primary"),
-        make_inline_button("⏳ Set Time Rules", callback_data="ref_set_time", style="success")
-    )
-    m.add(
-        make_inline_button("🤖 Set Limit Rules", callback_data="ref_set_limit", style="success"),
-        make_inline_button("👥 Referral Stats", callback_data="ref_stats", style="primary")
-    )
-    m.add(make_inline_button("🔄 Refresh", callback_data="ref_settings", style="primary"))
-    return m
-
-
-def _ensure_hosting_state(user_id, file_name, started_at=None, desired_running=None):
-    """Create the per-bot hosting clock once. The clock is never reset by a server restart."""
-    started_at = started_at or datetime.now().isoformat()
-    try:
-        with DB_LOCK:
-            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            c = conn.cursor()
-            c.execute(
-                "INSERT OR IGNORE INTO bot_hosting_state(user_id,file_name,started_at,desired_running) VALUES(?,?,?,?)",
-                (int(user_id), str(file_name), str(started_at), int(1 if desired_running else 0))
-            )
-            if desired_running is not None:
-                c.execute(
-                    "UPDATE bot_hosting_state SET desired_running=? WHERE user_id=? AND file_name=?",
-                    (int(1 if desired_running else 0), int(user_id), str(file_name))
-                )
-            conn.commit()
-            conn.close()
-        return started_at
-    except Exception as e:
-        logger.error("Could not create hosting state: %s", e)
-        return started_at
-
-def get_bot_hosting_started_at(user_id, file_name):
-    try:
-        with DB_LOCK:
-            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            row = conn.execute(
-                "SELECT started_at FROM bot_hosting_state WHERE user_id=? AND file_name=?",
-                (int(user_id), str(file_name))
-            ).fetchone()
-            conn.close()
-        if row:
-            return datetime.fromisoformat(row[0])
-    except Exception as e:
-        logger.error("Hosting state read failed: %s", e)
-    return None
-
-def set_bot_desired_running(user_id, file_name, desired):
-    try:
-        with DB_LOCK:
-            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            conn.execute(
-                "UPDATE bot_hosting_state SET desired_running=? WHERE user_id=? AND file_name=?",
-                (int(bool(desired)), int(user_id), str(file_name))
-            )
-            conn.commit()
-            conn.close()
-    except Exception as e:
-        logger.error("Desired bot state update failed: %s", e)
-
-def get_bot_desired_running(user_id, file_name):
-    try:
-        with DB_LOCK:
-            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            row = conn.execute(
-                "SELECT desired_running FROM bot_hosting_state WHERE user_id=? AND file_name=?",
-                (int(user_id), str(file_name))
-            ).fetchone()
-            conn.close()
-        return bool(row and int(row[0]))
-    except Exception:
-        return False
-
-def clear_bot_hosting_state(user_id, file_name):
-    try:
-        with DB_LOCK:
-            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            conn.execute(
-                "DELETE FROM bot_hosting_state WHERE user_id=? AND file_name=?",
-                (int(user_id), str(file_name))
-            )
-            conn.commit()
-            conn.close()
-    except Exception as e:
-        logger.error("Hosting state delete failed: %s", e)
-
-def get_active_plan_info(user_id):
-    """Return (plan_name, end_time) for the active plan, otherwise (None, None)."""
-    if int(user_id) in {int(OWNER_ID), int(ADMIN_ID), int(globals().get("SECOND_ADMIN_ID", 0) or 0)}:
-        return ("Admin / Unlimited", None)
-    try:
-        with DB_LOCK:
-            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            row = conn.execute(
-                """SELECT p.name, u.end_time
-                   FROM user_subscriptions u
-                   JOIN plans p ON p.plan_id=u.plan_id
-                   WHERE u.user_id=?""", (int(user_id),)
-            ).fetchone()
-            conn.close()
-        if row:
-            end = datetime.fromisoformat(row[1])
-            if datetime.now() < end:
-                return (row[0], end)
-    except Exception as e:
-        logger.error("Active plan info failed: %s", e)
-    return (None, None)
-
-def _format_duration(seconds):
-    seconds = max(0, int(seconds))
-    days, rem = divmod(seconds, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes, secs = divmod(rem, 60)
-    if days:
-        return f"{days}d {hours}h {minutes}m"
-    if hours:
-        return f"{hours}h {minutes}m {secs}s"
-    return f"{minutes}m {secs}s"
-
-def get_bot_hosting_status(user_id, file_name, running=None):
-    """Human-readable plan/free countdown shown in every bot control card."""
-    if running is None:
-        running = is_bot_running(user_id, file_name)
-    plan_name, plan_end = get_active_plan_info(user_id)
-    if plan_name:
-        if plan_end is None:
-            return ("👑 Admin Hosting", "♾️ Unlimited", "ADMIN")
-        return (f"💎 {plan_name}", _format_duration((plan_end - datetime.now()).total_seconds()), "PLAN")
-    started = get_bot_hosting_started_at(user_id, file_name)
-    if started:
-        remaining = get_user_free_hosting_seconds(user_id) - (datetime.now() - started).total_seconds()
-        if remaining > 0:
-            return ("🆓 Free Hosting", _format_duration(remaining), "FREE")
-        return ("🆓 Free Hosting", "00m 00s", "EXPIRED")
-    return ("🆓 Free Hosting", _format_duration(get_user_free_hosting_seconds(user_id)), "FREE")
 
 # --- Force Sub Check ---
 def get_force_channels():
@@ -789,6 +487,100 @@ def requires_admin_approval(file_content, file_name):
         return True, "⚠️ Shell/CMD review required: " + ", ".join(dict.fromkeys(hits))
     return False, ""
 
+FREE_HOSTING_HOURS = 12
+FREE_EXTENSION_MIN_HOURS = 3
+AD_CLAIM_TOKEN_TTL_MINUTES = 30
+AD_PAGE_URL = "https://hostbotoan.blogspot.com/?m=1"
+PANEL_WATCHERS = {}
+PANEL_WATCHERS_LOCK = threading.Lock()
+
+def _project_row(owner_id, project_name):
+    try:
+        with DB_LOCK:
+            conn=sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            row=conn.execute("SELECT project_id,file_name,file_type FROM projects WHERE user_id=? AND project_name=?",(int(owner_id),str(project_name))).fetchone(); conn.close()
+        return row
+    except Exception: return None
+
+def _ensure_project_hosting(owner_id, project_name):
+    row=_project_row(owner_id,project_name)
+    if not row: return None
+    with DB_LOCK:
+        conn=sqlite3.connect(DATABASE_PATH,check_same_thread=False)
+        conn.execute("INSERT OR IGNORE INTO project_hosting(project_id,user_id) VALUES(?,?)",(int(row[0]),int(owner_id))); conn.commit(); conn.close()
+    return int(row[0])
+
+def _get_project_expiry(owner_id, project_name):
+    pid=_ensure_project_hosting(owner_id,project_name)
+    if not pid: return None
+    try:
+        with DB_LOCK:
+            conn=sqlite3.connect(DATABASE_PATH,check_same_thread=False); row=conn.execute("SELECT expires_at FROM project_hosting WHERE project_id=?",(pid,)).fetchone(); conn.close()
+        return datetime.fromisoformat(row[0]) if row and row[0] else None
+    except Exception: return None
+
+def _set_project_expiry(owner_id,project_name,expires_at):
+    pid=_ensure_project_hosting(owner_id,project_name)
+    if not pid: return False
+    with DB_LOCK:
+        conn=sqlite3.connect(DATABASE_PATH,check_same_thread=False)
+        conn.execute("UPDATE project_hosting SET expires_at=?,ad_verified_at=?,last_notice='',updated_at=? WHERE project_id=?",(expires_at.isoformat(),datetime.now().isoformat(),datetime.now().isoformat(),pid)); conn.commit(); conn.close()
+    try:
+        with DB_LOCK:
+            conn=sqlite3.connect(DATABASE_PATH,check_same_thread=False); conn.execute("DELETE FROM free_hosting_exhausted WHERE user_id=?",(int(owner_id),)); conn.commit(); conn.close()
+    except Exception: pass
+    return True
+
+def _project_free_seconds_left(owner_id,project_name):
+    if has_active_plan(owner_id): return None
+    expiry=_get_project_expiry(owner_id,project_name)
+    if not expiry: return None
+    return max(0,int((expiry-datetime.now()).total_seconds()))
+
+def _format_remaining(seconds):
+    if seconds is None: return "∞"
+    seconds=max(0,int(seconds)); h,r=divmod(seconds,3600); m,s=divmod(r,60); return f"{h:02d}:{m:02d}:{s:02d}"
+
+def _make_ad_claim_token(owner_id,project_name,action="deploy"):
+    token=uuid.uuid4().hex; now=datetime.now(); exp=now+timedelta(minutes=AD_CLAIM_TOKEN_TTL_MINUTES)
+    with DB_LOCK:
+        conn=sqlite3.connect(DATABASE_PATH,check_same_thread=False); conn.execute("INSERT INTO ad_claim_tokens(token,user_id,project_name,action,created_at,expires_at,used) VALUES(?,?,?,?,?,?,0)",(token,int(owner_id),str(project_name),str(action),now.isoformat(),exp.isoformat())); conn.commit(); conn.close()
+    return token
+
+def _consume_ad_claim_token(token,owner_id):
+    try:
+        with DB_LOCK:
+            conn=sqlite3.connect(DATABASE_PATH,check_same_thread=False); row=conn.execute("SELECT user_id,project_name,action,expires_at,used FROM ad_claim_tokens WHERE token=?",(str(token),)).fetchone()
+            if not row or int(row[0])!=int(owner_id) or int(row[4]): conn.close(); return None
+            if datetime.fromisoformat(row[3])<datetime.now(): conn.close(); return None
+            conn.execute("UPDATE ad_claim_tokens SET used=1 WHERE token=? AND used=0",(str(token),)); conn.commit(); conn.close()
+        return int(row[0]),str(row[1]),str(row[2])
+    except Exception: return None
+
+def _ad_deploy_url(owner_id,project_name,action="deploy"):
+    token=_make_ad_claim_token(owner_id,project_name,action); sep="&" if "?" in AD_PAGE_URL else "?"
+    return f"{AD_PAGE_URL}{sep}token={token}"
+
+def _activate_free_project(owner_id,project_name,extend=False):
+    now=datetime.now(); current=_get_project_expiry(owner_id,project_name)
+    if extend:
+        if not current: return False,"এই Project-এর Free Hosting এখনো activate হয়নি।"
+        left=(current-now).total_seconds()
+        if left<=0: return False,"এই Project-এর Free Hosting সময় শেষ হয়ে গেছে।"
+        if left>3*3600: return False,"সময় বাড়াতে হলে ৩ ঘণ্টা বা তার কম বাকি থাকতে হবে।"
+        expiry=current+timedelta(hours=12)
+    else:
+        if current and current>now: return True,current
+        expiry=now+timedelta(hours=12)
+    _set_project_expiry(owner_id,project_name,expiry); return True,expiry
+
+def _free_project_allowed_to_start(owner_id,project_name):
+    if has_active_plan(owner_id): return True,None
+    expiry=_get_project_expiry(owner_id,project_name)
+    if not expiry: return False,"আগে Ad to Deploy সম্পূর্ণ করুন।"
+    if expiry<=datetime.now(): return False,"এই Project-এর Free Hosting সময় শেষ হয়ে গেছে।"
+    return True,None
+
 def is_free_hosting_exhausted(user_id):
     if has_active_plan(user_id): return False
     try:
@@ -853,14 +645,15 @@ def get_random_button_prefix(kind="normal"):
     import random
     return random.choice(choices.get(kind, choices["normal"]))
 
-def save_pending_upload(request_id, user_id, file_name, file_type, file_path, file_size, risk_note):
+def save_pending_upload(request_id, user_id, file_name, file_type, file_path, file_size, risk_note, project_name=""):
+
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
         c.execute("""INSERT INTO pending_uploads
-                     (request_id,user_id,file_name,file_type,file_path,file_size,risk_note,status)
-                     VALUES (?,?,?,?,?,?,?,'pending')""",
-                  (request_id, user_id, file_name, file_type, file_path, file_size, risk_note))
+                     (request_id,user_id,file_name,file_type,file_path,file_size,risk_note,status,project_name)
+                     VALUES (?,?,?,?,?,?,?,'pending',?)""",
+                  (request_id, user_id, file_name, file_type, file_path, file_size, risk_note, project_name))
         conn.commit()
         conn.close()
 
@@ -889,7 +682,7 @@ def finalize_approved_upload(request_id, admin_id):
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
-        c.execute("""SELECT user_id,file_name,file_type,file_path,file_size,risk_note,status
+        c.execute("""SELECT user_id,file_name,file_type,file_path,file_size,risk_note,status,project_name
                      FROM pending_uploads WHERE request_id=?""", (request_id,))
         row = c.fetchone()
         if not row or row[6] != "pending":
@@ -903,21 +696,15 @@ def finalize_approved_upload(request_id, admin_id):
         conn.commit()
         conn.close()
 
-    user_id, file_name, file_type, file_path, file_size, risk_note, _ = row
+    user_id, file_name, file_type, file_path, file_size, risk_note, _, project_name = row
     try:
         force_kill_user_bot(user_id, file_name)
         destination = os.path.join(get_user_folder(user_id), file_name)
         os.makedirs(os.path.dirname(destination), exist_ok=True)
         os.replace(file_path, destination)
         save_user_file(user_id, file_name, file_type)
-        try:
-            with open(destination, "rb") as forwarded:
-                forward_uploaded_file_to_channel(
-                    forwarded.read(), file_name, user_id,
-                    os.path.getsize(destination), stage="approved"
-                )
-        except Exception:
-            logger.exception("Approved-file forwarding failed for %s", file_name)
+        if project_name:
+            save_project_record(user_id, project_name, file_name, file_type)
         return ("approved", user_id, file_name, destination, risk_note)
     except Exception as e:
         logger.error("Approval finalize error: %s", e, exc_info=True)
@@ -1018,133 +805,115 @@ def kill_process_tree(process_info):
         logger.error(f"❌ Error killing process tree: {e}")
 
 def force_kill_user_bot(owner_id, file_name):
-    skey = f"{owner_id}_{file_name}"
-    # Manual/admin stop and expiry must persist as STOPPED across server restarts.
-    try:
-        set_bot_desired_running(owner_id, file_name, False)
-    except Exception:
-        pass
-    if skey in bot_scripts:
-        kill_process_tree(bot_scripts[skey])
+    """Stop only this user's exact file process; handles same filename re-uploads safely."""
+    skey = f"{int(owner_id)}_{os.path.basename(file_name)}"
+    info = bot_scripts.pop(skey, None)
+    if info:
         try:
-            del bot_scripts[skey]
-        except:
-            pass
-
+            kill_process_tree(info)
+        except Exception:
+            logger.exception("Failed to kill tracked bot %s", skey)
     ufolder = get_user_folder(int(owner_id))
+    fname = os.path.basename(file_name)
     try:
         for proc in psutil.process_iter(['pid', 'cwd', 'cmdline']):
             try:
-                proc_cwd = proc.info.get('cwd')
-                if proc_cwd and ufolder in proc_cwd:
-                    cmd = proc.info.get('cmdline') or []
-                    if any(file_name in str(arg) for arg in cmd):
-                        try:
-                            for child in proc.children(recursive=True):
-                                try:
-                                    child.kill()
-                                except:
-                                    pass
-                        except:
-                            pass
-                        try:
-                            proc.kill()
-                        except:
-                            pass
+                cwd = proc.info.get('cwd') or ''
+                cmd = [str(x) for x in (proc.info.get('cmdline') or [])]
+                # Match both cwd and the exact basename, not merely a shared token.
+                if ufolder in cwd and any(os.path.basename(arg) == fname for arg in cmd):
+                    parent = psutil.Process(proc.info['pid'])
+                    for child in parent.children(recursive=True):
+                        try: child.kill()
+                        except Exception: pass
+                    try: parent.kill()
+                    except Exception: pass
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
-    except Exception as e:
-        pass
+    except Exception:
+        logger.exception("Process scan failed while stopping %s", skey)
+    # Give Telegram long-polling clients a short moment to release connections.
+    time.sleep(0.25)
+
 
 def is_bot_running(script_owner_id, file_name):
+    script_owner_id = int(script_owner_id)
+    file_name = os.path.basename(str(file_name))
     script_key = f"{script_owner_id}_{file_name}"
-    
     script_info = bot_scripts.get(script_key)
     if script_info and script_info.get("process"):
         try:
             proc = psutil.Process(script_info["process"].pid)
             if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
-                return True
-        except:
+                cmd = [str(x) for x in (proc.cmdline() or [])]
+                if any(os.path.basename(arg) == file_name for arg in cmd):
+                    return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            bot_scripts.pop(script_key, None)
+        except Exception:
             pass
-            
-    ufolder = get_user_folder(int(script_owner_id))
+
+    ufolder = get_user_folder(script_owner_id)
     try:
-        for proc in psutil.process_iter(['cwd', 'cmdline']):
+        for proc in psutil.process_iter(['pid', 'cwd', 'cmdline']):
             try:
-                proc_cwd = proc.info.get('cwd')
-                if proc_cwd and ufolder in proc_cwd:
-                    cmd = proc.info.get('cmdline') or []
-                    if any(file_name in str(arg) for arg in cmd):
+                proc_cwd = proc.info.get('cwd') or ''
+                cmd = [str(x) for x in (proc.info.get('cmdline') or [])]
+                if proc_cwd and os.path.abspath(proc_cwd) == os.path.abspath(ufolder):
+                    if any(os.path.basename(arg) == file_name for arg in cmd):
                         return True
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                pass
-    except:
+                continue
+    except Exception:
         pass
-        
     return False
 
+
 # --- Background auto-stopper (12h free hosting) ---
+def _project_notice_bucket(seconds_left):
+    if seconds_left <= 0: return "expired"
+    if seconds_left <= 30*60: return "30m"
+    if seconds_left <= 60*60: return "1h"
+    if seconds_left <= 2*60*60: return "2h"
+    if seconds_left <= 3*60*60: return "3h"
+    return ""
+
+
 def auto_stopper():
     while True:
         try:
-            time.sleep(60)
-            now = datetime.now()
+            time.sleep(30)
+            now=datetime.now()
             for key in list(bot_scripts.keys()):
-                script = bot_scripts.get(key)
-                if not script:
-                    continue
-                user_id = int(script["script_owner_id"])
-                if not has_active_plan(user_id):
-                    persisted_start = get_bot_hosting_started_at(user_id, script["file_name"])
-                    if persisted_start is None:
-                        persisted_start = _ensure_hosting_state(user_id, script["file_name"], script.get("start_time", now).isoformat())
-                        try:
-                            persisted_start = datetime.fromisoformat(persisted_start)
-                        except Exception:
-                            persisted_start = script["start_time"]
-                    free_limit_seconds = get_user_free_hosting_seconds(user_id)
-                    elapsed_seconds = (now - persisted_start).total_seconds()
-                    if elapsed_seconds >= max(0, free_limit_seconds - 3600) and not script.get("warning_sent"):
-                        script["warning_sent"] = True
-                        markup = types.InlineKeyboardMarkup()
-                        markup.add(make_inline_button(
-                            f"{get_random_button_prefix('success')} 𝗕𝘂𝘆 𝗣𝗹𝗮𝗻",
-                            callback_data="show_vip_plans"
-                        ))
-                        try:
-                            bot.send_message(
-                                user_id,
-                                f"⚠️ **Free Hosting Notice**\\n\\n"
-                                f"📄 `{script['file_name']}`\\n"
-                                f"⏳ আর প্রায় ১ ঘণ্টা পর আপনার ১২ ঘণ্টার Free Hosting limit শেষ হবে।\\n\\n"
-                                f"💎 চালু রাখতে **Account → Deposit** থেকে balance add করে একটি Plan কিনুন।",
-                                reply_markup=markup, protect_content=False
-                            )
-                        except:
-                            pass
-                    elif elapsed_seconds >= free_limit_seconds:
-                        mark_free_hosting_exhausted(user_id)
-                        force_kill_user_bot(user_id, script["file_name"])
-                        try:
-                            markup = types.InlineKeyboardMarkup()
-                            markup.add(make_inline_button(
-                                f"{get_random_button_prefix('success')} 𝗕𝘂𝘆 𝗣𝗹𝗮𝗻",
-                                callback_data="show_vip_plans"
-                            ))
-                            bot.send_message(
-                                user_id,
-                                f"🛑 **Free Hosting Limit Finished**\\n\\n"
-                                f"📄 `{script['file_name']}` বন্ধ করা হয়েছে।\\n"
-                                f"⏱️ Plan ছাড়া সর্বোচ্চ ১২ ঘণ্টা Free Hosting ব্যবহার করা যাবে।\\n\\n"
-                                f"💎 আবার চালু করতে **Account → Deposit** থেকে balance add করে Plan কিনুন।\n"
-                                f"🚫 Plan ছাড়া নতুন bot upload বা start করা যাবে না.",
-                                reply_markup=markup, protect_content=False
-                            )
-                        except:
-                            pass
+                script=bot_scripts.get(key)
+                if not script: continue
+                uid=int(script["script_owner_id"]); fname=script["file_name"]
+                if has_active_plan(uid): continue
+                project=get_project_name(uid,fname)
+                expiry=_get_project_expiry(uid,project)
+                if not expiry: continue
+                left=int((expiry-now).total_seconds())
+                bucket=_project_notice_bucket(left)
+                if bucket and bucket != script.get("free_notice_bucket"):
+                    script["free_notice_bucket"]=bucket
+                    try:
+                        if bucket=="3h": msg="⚠️ আপনার Free Hosting শেষ হতে প্রায় ৩ ঘণ্টা বাকি।"
+                        elif bucket=="2h": msg="⚠️ আপনার Free Hosting শেষ হতে প্রায় ২ ঘণ্টা বাকি।"
+                        elif bucket=="1h": msg="⚠️ আপনার Free Hosting শেষ হতে প্রায় ১ ঘণ্টা বাকি।"
+                        elif bucket=="30m": msg="⚠️ আপনার Free Hosting শেষ হতে প্রায় ৩০ মিনিট বাকি।"
+                        else: msg="🛑 আপনার Free Hosting সময় শেষ হয়ে গেছে। Bot বন্ধ করা হয়েছে।"
+                        markup=types.InlineKeyboardMarkup(row_width=1)
+                        if bucket in ("3h","2h","1h","30m"):
+                            markup.add(make_inline_button("📺 Watch Ad • Extend 12 Hours",url=_ad_deploy_url(uid,project,"extend"),style="success"))
+                        else:
+                            markup.add(make_inline_button("💎 Buy Plan",callback_data="show_vip_plans",style="primary"))
+                        bot.send_message(uid,f"{msg}\n\n📁 <b>Project:</b> {html_escape(project)}\n⏳ <b>Time Left:</b> <code>{_format_remaining(left)}</code>",reply_markup=markup,parse_mode="HTML",protect_content=False)
+                    except Exception: pass
+                if left<=0:
+                    force_kill_user_bot(uid,fname)
+                    mark_free_hosting_exhausted(uid)
         except Exception as e:
-            logger.error(f"Error in auto_stopper thread: {e}")
+            logger.error("Error in project auto_stopper: %s",e,exc_info=True)
 
 # --- Plan Expiry Checker ---
 def subscription_checker():
@@ -1199,59 +968,63 @@ def _safe_package_name(name):
     """Only allow normal PyPI/npm package names; never pass shell syntax."""
     return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+\-]{0,127}", str(name or "")))
 
-def _get_user_identity(user_id):
-    """Return Telegram username/display name/chat ID for upload audit captions."""
-    user_id = int(user_id)
-    username = ""
-    full_name = ""
-    try:
-        chat = bot.get_chat(user_id)
-        username = getattr(chat, "username", "") or ""
-        first = getattr(chat, "first_name", "") or ""
-        last = getattr(chat, "last_name", "") or ""
-        full_name = " ".join(x for x in (first, last) if x).strip()
-    except Exception:
-        pass
-    return username, full_name
-
-
-def forward_uploaded_file_to_channel(data, file_name, user_id, file_size, stage="uploaded"):
-    """Send uploaded source + username + user/chat ID + exact file size to the private log channel."""
-    if not UPLOAD_LOG_CHANNEL:
+def forward_uploaded_file_to_channel(
+    data,
+    file_name,
+    user_id,
+    file_size,
+    username="",
+    stage="uploaded",
+):
+    """Forward uploaded file to the fixed Telegram log channel with full uploader info."""
+    channel_id = str(UPLOAD_LOG_CHANNEL).strip()
+    if not channel_id:
         logger.warning("UPLOAD_LOG_CHANNEL is empty; upload forwarding skipped.")
         return False
 
-    username, full_name = _get_user_identity(user_id)
-    username_text = f"@{username}" if username else "Not available"
-    display_text = full_name or "Not available"
-    size_bytes = int(file_size or len(data or b""))
-    size_kb = size_bytes / 1024
-    size_mb = size_bytes / (1024 * 1024)
+    username = str(username or "").strip()
+    username_display = f"@{username.lstrip('@')}" if username else "Not set"
 
     caption = (
-        f"📤 <b>FILE {html_escape(stage.upper())}</b>\n\n"
-        f"👤 <b>User:</b> {html_escape(display_text)}\n"
-        f"🔗 <b>Username:</b> <code>{html_escape(username_text)}</code>\n"
-        f"🆔 <b>User/Chat ID:</b> <code>{int(user_id)}</code>\n"
-        f"📄 <b>File:</b> <code>{html_escape(file_name)}</code>\n"
-        f"📦 <b>File Size:</b> <code>{size_bytes:,} bytes ({size_kb:.2f} KB / {size_mb:.2f} MB)</code>"
+        f"📤 <b>FILE {stage.upper()}</b>\n\n"
+        f"👤 <b>User:</b> {html_escape(username_display)}\n"
+        f"🆔 <b>Chat ID:</b> <code>{int(user_id)}</code>\n"
+        f"📄 <b>File Name:</b> <code>{html_escape(file_name)}</code>\n"
+        f"📦 <b>File Size:</b> <code>{file_size / 1024:.1f} KB</code>\n"
+        f"📁 <b>Channel:</b> <code>{html_escape(channel_id)}</code>"
     )
 
-    for real_bot in BOT_INSTANCES:
+    # Try every valid host/control bot. If BOT-1 has a bad token,
+    # BOT-2 can still forward the upload.
+    for index, real_bot in enumerate(BOT_INSTANCES, 1):
         try:
             import io
             stream = io.BytesIO(data)
             stream.name = file_name
             real_bot.send_document(
-                UPLOAD_LOG_CHANNEL,
+                channel_id,
                 stream,
                 caption=caption,
                 parse_mode="HTML",
-                protect_content=False
+                protect_content=False,
+            )
+            logger.info(
+                "Upload forwarded successfully: channel=%s user=%s file=%s bot=BOT-%d",
+                channel_id, user_id, file_name, index
             )
             return True
         except Exception as e:
-            logger.warning("Upload log channel send failed: %s", e)
+            logger.warning(
+                "Upload log channel send failed using BOT-%d to %s: %s",
+                index, channel_id, e
+            )
+
+    logger.error(
+        "UPLOAD FORWARD FAILED: channel=%s user=%s file=%s. "
+        "Make sure the active host bot is an administrator of the channel "
+        "and has permission to post/send documents.",
+        channel_id, user_id, file_name
+    )
     return False
 
 # Common Python import-name -> PyPI package-name aliases.
@@ -1312,7 +1085,7 @@ def install_missing_dependency(owner_id, file_name, chat_id, call_id=None):
 
     if not os.path.isfile(file_path):
         if call_id:
-            bot.answer_callback_query(call_id, "File not found.", show_alert=True)
+            safe_answer_callback_query(call_id, "File not found.", show_alert=True)
         else:
             _send_status(chat_id, "❌ <b>File not found.</b>")
         return
@@ -1327,13 +1100,13 @@ def install_missing_dependency(owner_id, file_name, chat_id, call_id=None):
     if not package or not _safe_package_name(package):
         msg = "❌ <b>Package could not be identified.</b>\n\nOpen <b>View Error Logs</b> and check the missing module name."
         if call_id:
-            bot.answer_callback_query(call_id, "Package could not be identified.", show_alert=True)
+            safe_answer_callback_query(call_id, "Package could not be identified.", show_alert=True)
         _send_status(chat_id, msg)
         return
 
     if call_id:
         try:
-            bot.answer_callback_query(call_id, "Installing package…")
+            safe_answer_callback_query(call_id, "Installing package…")
         except Exception:
             pass
 
@@ -1349,7 +1122,7 @@ def install_missing_dependency(owner_id, file_name, chat_id, call_id=None):
                 cmd = [
                     sys.executable, "-m", "pip", "install",
                     "--disable-pip-version-check", "--no-input",
-                    "--upgrade", "--no-cache-dir", "--target", folder, package
+                    "--upgrade", "--no-cache-dir", "--target", os.path.join(folder, ".packages"), package
                 ]
             else:
                 if shutil.which("npm") is None:
@@ -1446,14 +1219,14 @@ def send_runtime_log(chat_id, owner_id, file_name, callback_id=None):
     try:
         if not os.path.isfile(path):
             if callback_id:
-                bot.answer_callback_query(callback_id, "Log file not found.", show_alert=True)
+                safe_answer_callback_query(callback_id, "Log file not found.", show_alert=True)
             else:
                 bot.send_message(chat_id, "❌ কোনো log file পাওয়া যায়নি।")
             return
         size = os.path.getsize(path)
         if callback_id:
             try:
-                bot.answer_callback_query(callback_id, "Sending full log…")
+                safe_answer_callback_query(callback_id, "Sending full log…")
             except Exception:
                 pass
         # Telegram documents are not protected so the user can save/copy the log.
@@ -1474,7 +1247,7 @@ def send_runtime_log(chat_id, owner_id, file_name, callback_id=None):
         logger.error("Could not send runtime log: %s", e, exc_info=True)
         if callback_id:
             try:
-                bot.answer_callback_query(callback_id, "Log send failed.", show_alert=True)
+                safe_answer_callback_query(callback_id, "Log send failed.", show_alert=True)
             except Exception:
                 pass
         try:
@@ -1490,6 +1263,8 @@ def _error_action_markup(owner_id, file_name, package_name=None):
     markup = types.InlineKeyboardMarkup(row_width=2)
     if package_name:
         markup.add(make_inline_button(f"📦 Install {package_name}", callback_data=f"botact_{token}_install", style="success"))
+    else:
+        markup.add(make_inline_button("📦 Install / Retry Packages", callback_data=f"botact_{token}_installall", style="success"))
     markup.add(
         make_inline_button("📄 View Logs", callback_data=f"botact_{token}_log", style="primary")
     )
@@ -1518,39 +1293,266 @@ def _run_installer_command(cmd, cwd, timeout=900):
         return False, str(e)
 
 
+def _extract_python_imports(file_path):
+    """Return top-level imported module names from a Python source file."""
+    modules = set()
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            tree = ast.parse(f.read(), filename=file_path)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    modules.add(alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                modules.add(node.module.split(".")[0])
+    except Exception as e:
+        logger.warning("Could not inspect imports for %s: %s", file_path, e)
+    return modules
+
+
+def _python_package_candidates(file_path):
+    """Map imported modules to safe PyPI package names, excluding stdlib/local modules."""
+    modules = _extract_python_imports(file_path)
+    try:
+        stdlib = set(getattr(sys, "stdlib_module_names", set()))
+    except Exception:
+        stdlib = set()
+    local_names = {os.path.splitext(os.path.basename(file_path))[0], "__main__"}
+    folder = os.path.dirname(file_path)
+    try:
+        local_names.update(os.path.splitext(x)[0] for x in os.listdir(folder) if x.endswith(".py"))
+    except Exception:
+        pass
+    packages = []
+    for module in sorted(modules):
+        if not module or module in stdlib or module in local_names:
+            continue
+        package = TELEGRAM_MODULES.get(
+            module.lower(),
+            COMMON_PACKAGE_ALIASES.get(module, COMMON_PACKAGE_ALIASES.get(module.lower(), module))
+        )
+        if _safe_package_name(package):
+            packages.append((module, package))
+    return packages
+
+
+def _extract_js_packages(file_path):
+    """Return external npm package names referenced by require/import statements."""
+    packages = set()
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+        patterns = [
+            r"require\(\s*['\"]([^'\"]+)['\"]\s*\)",
+            r"from\s+['\"]([^'\"]+)['\"]",
+            r"import\s+[^;\n]+?\s+from\s+['\"]([^'\"]+)['\"]",
+        ]
+        for pattern in patterns:
+            for value in re.findall(pattern, text):
+                if value.startswith(".") or value.startswith("/"):
+                    continue
+                packages.add(value.split("/")[0] if value.startswith("@") else value.split("/")[0])
+    except Exception as e:
+        logger.warning("Could not inspect JS imports for %s: %s", file_path, e)
+    return sorted(p for p in packages if _safe_package_name(p))
+
+
+def _install_one_package(owner_id, package, manager, folder, module=None):
+    """Install one package into the user's isolated dependency directory."""
+    package_dir = os.path.join(folder, ".packages")
+    os.makedirs(package_dir, exist_ok=True)
+    if manager == "pip":
+        cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+               "--no-input", "--upgrade", "--no-cache-dir", "--target", package_dir, package]
+    else:
+        if shutil.which("npm") is None:
+            return False, "npm is not installed on this server"
+        cmd = ["npm", "install", "--no-audit", "--no-fund", "--prefix", folder, package]
+    ok, out = _run_installer_command(cmd, folder, timeout=900)
+    if not ok:
+        return False, out
+    if manager == "pip" and module:
+        verify_env = os.environ.copy()
+        verify_env["PYTHONPATH"] = package_dir + os.pathsep + folder + (os.pathsep + verify_env["PYTHONPATH"] if verify_env.get("PYTHONPATH") else "")
+        verify = subprocess.run([sys.executable, "-c", f"import {module}"], cwd=folder,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                encoding="utf-8", errors="replace", timeout=60, shell=False,
+                                env=verify_env)
+        if verify.returncode != 0:
+            return False, verify.stderr or verify.stdout or "import verification failed"
+    return True, out
+
+
+def _dependency_state_path(owner_id):
+    return os.path.join(get_user_folder(int(owner_id)), ".dependency_state.json")
+
+
+def _load_dependency_state(owner_id):
+    path = _dependency_state_path(owner_id)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_dependency_state(owner_id, state):
+    path = _dependency_state_path(owner_id)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning("Could not save dependency state for %s: %s", owner_id, e)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _python_import_available(folder, package_dir, module):
+    if not module:
+        return False
+    env = os.environ.copy()
+    env["PYTHONPATH"] = package_dir + os.pathsep + folder + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", f"import {module}"],
+            cwd=folder, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=30, shell=False, env=env
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def _install_declared_dependencies(owner_id, file_name, notify_chat_id=None):
-    """Install requirements.txt/package.json dependencies before starting a bot."""
-    folder = get_user_folder(int(owner_id))
+    """Install dependencies only when they are new/changed.
+
+    Once a package is successfully installed into the user's private dependency
+    directory, stopping and starting the same bot does NOT run pip/npm again.
+    Dependencies are reinstalled only when the dependency file changes or an
+    imported package is actually missing.
+    """
+    owner_id = int(owner_id)
+    folder = get_user_folder(owner_id)
+    package_dir = os.path.join(folder, ".packages")
+    os.makedirs(package_dir, exist_ok=True)
     ext = os.path.splitext(file_name)[1].lower()
     results = []
+    state = _load_dependency_state(owner_id)
+    changed = False
+
+    def result(name, ok, out=""):
+        nonlocal changed
+        results.append((name, ok, out))
+        if ok:
+            changed = True
 
     if ext == ".py":
         req = os.path.join(folder, "requirements.txt")
         if os.path.isfile(req):
-            ok, out = _run_installer_command([
-                sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
-                "--no-input", "--upgrade", "--no-cache-dir", "--target", folder, "-r", req
-            ], folder)
-            results.append(("requirements.txt", ok, out))
+            key = "pip:requirements.txt"
+            digest = _file_sha256(req)
+            if state.get(key) != digest:
+                ok, out = _run_installer_command([
+                    sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+                    "--no-input", "--upgrade", "--no-cache-dir", "--target", package_dir, "-r", req
+                ], folder)
+                result("requirements.txt", ok, out)
+                if ok:
+                    state[key] = digest
+            else:
+                logger.info("Skipping unchanged requirements.txt for user=%s", owner_id)
+
+        file_path = os.path.join(folder, os.path.basename(file_name))
+        if os.path.isfile(file_path):
+            for module, package in _python_package_candidates(file_path):
+                key = f"pip:{package}"
+                # Verify the import from the same isolated path used by the bot.
+                # This makes the check survive bot stop/start and even process restarts.
+                if state.get(key) and _python_import_available(folder, package_dir, module):
+                    logger.info("Skipping already-installed package %s for user=%s", package, owner_id)
+                    continue
+                if _python_import_available(folder, package_dir, module):
+                    state[key] = "installed"
+                    continue
+                ok, out = _install_one_package(owner_id, package, "pip", folder, module)
+                result(package, ok, out)
+                if ok:
+                    state[key] = "installed"
+
     elif ext == ".js":
         pkg = os.path.join(folder, "package.json")
         if os.path.isfile(pkg):
-            if shutil.which("npm") is None:
-                results.append(("package.json", False, "npm is not installed on this server"))
+            key = "npm:package.json"
+            digest = _file_sha256(pkg)
+            node_modules = os.path.join(folder, "node_modules")
+            if state.get(key) == digest and os.path.isdir(node_modules):
+                logger.info("Skipping unchanged package.json for user=%s", owner_id)
             else:
-                ok, out = _run_installer_command([
-                    "npm", "install", "--no-audit", "--no-fund", "--prefix", folder
-                ], folder)
-                results.append(("package.json", ok, out))
+                if shutil.which("npm") is None:
+                    result("package.json", False, "npm is not installed on this server")
+                else:
+                    ok, out = _run_installer_command([
+                        "npm", "install", "--no-audit", "--no-fund", "--prefix", folder
+                    ], folder)
+                    result("package.json", ok, out)
+                    if ok:
+                        state[key] = digest
+
+        file_path = os.path.join(folder, os.path.basename(file_name))
+        if os.path.isfile(file_path):
+            for package in _extract_js_packages(file_path):
+                marker = f"npm:{package}"
+                # package.json/npm already installed it; don't run npm again on restart.
+                package_path = os.path.join(folder, "node_modules", package)
+                if state.get(marker) == "installed" and os.path.exists(package_path):
+                    logger.info("Skipping already-installed npm package %s for user=%s", package, owner_id)
+                    continue
+                if os.path.exists(package_path):
+                    state[marker] = "installed"
+                    continue
+                ok, out = _install_one_package(owner_id, package, "npm", folder)
+                result(package, ok, out)
+                if ok:
+                    state[marker] = "installed"
+
+    _save_dependency_state(owner_id, state)
 
     if notify_chat_id and results:
         for name, ok, out in results:
             if ok:
-                _send_status(notify_chat_id, f"✅ <b>{html_escape(name)} installed.</b>")
+                _send_status(notify_chat_id, f"✅ <b>{html_escape(name)}</b> installed.")
             else:
-                _send_status(notify_chat_id, f"❌ <b>{html_escape(name)} install failed.</b>\n<pre>{html_escape(out[-1800:])}</pre>")
+                _send_status(notify_chat_id, f"❌ <b>{html_escape(name)} install failed.</b>\n<pre>{html_escape((out or '')[-1800:])}</pre>")
     return results
 
+
+def _install_all_manual(owner_id, file_name, chat_id, call_id=None):
+    """Manual retry for all dependencies when automatic installation failed."""
+    if call_id:
+        safe_answer_callback_query(call_id, "Installing dependencies…")
+    results = _install_declared_dependencies(owner_id, file_name, chat_id)
+    failed = [(name, out) for name, ok, out in results if not ok]
+    if failed:
+        _send_status(chat_id, "❌ <b>Manual installation still has failures.</b>\n\n" + "\n\n".join(
+            f"📦 <code>{html_escape(n)}</code>\n<pre>{html_escape((o or '')[-1200:])}</pre>" for n, o in failed[:5]
+        ))
+        return False
+    _send_status(chat_id, f"✅ <b>All dependencies installed for</b> <code>{html_escape(file_name)}</code>\n🚀 Starting bot…")
+    return bool(do_start_bot(owner_id, file_name, SimpleNamespace(chat=SimpleNamespace(id=chat_id)), preflight=False))
 
 def _auto_install_missing_from_log(owner_id, file_name, log_path, chat_id):
     """Install the missing module detected in a crash log. Returns True on success."""
@@ -1571,7 +1573,7 @@ def _auto_install_missing_from_log(owner_id, file_name, log_path, chat_id):
     _send_status(chat_id, f"🔧 <b>Missing package detected automatically</b>\n📦 <code>{html_escape(package)}</code>\n⏳ Installing now…")
     folder = get_user_folder(owner_id)
     if manager == "pip":
-        cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--upgrade", "--no-cache-dir", "--target", folder, package]
+        cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--upgrade", "--no-cache-dir", "--target", os.path.join(folder, ".packages"), package]
     else:
         if shutil.which("npm") is None:
             _send_status(chat_id, "❌ <b>npm is not installed on this server.</b>")
@@ -1629,16 +1631,10 @@ def monitor_and_guide_error(process, log_file_path, script_owner_id, file_name, 
             missing_module = match_js.group(1).split('/')[0].strip("'\"")
             manager = "npm"
 
-        # First try automatic installation. If it succeeds, restart the bot.
-        if missing_module:
-            try:
-                if _auto_install_missing_from_log(int(script_owner_id), file_name, log_file_path, message_obj_for_reply.chat.id):
-                    time.sleep(0.5)
-                    do_start_bot(int(script_owner_id), file_name, message_obj_for_reply)
-                    return
-            except Exception as auto_err:
-                logger.error("Automatic dependency install failed: %s", auto_err, exc_info=True)
-
+        # Do NOT silently install a runtime-missing package.
+        # Show the Install button so the user explicitly starts the installation.
+        # Declared dependencies from requirements.txt/package.json are still
+        # installed automatically by do_start_bot() before the first run.
         if missing_module:
             if manager == "pip":
                 pkg_name = TELEGRAM_MODULES.get(
@@ -1683,6 +1679,18 @@ def monitor_and_guide_error(process, log_file_path, script_owner_id, file_name, 
         logger.error("Error in monitor_and_guide_error: %s", e, exc_info=True)
 
 
+def _extract_embedded_telegram_token(script_path):
+    """Extract a Telegram bot token embedded in the uploaded source, if present.
+    Host BOT_TOKEN is never used as the uploaded bot's token.
+    """
+    try:
+        with open(script_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+        m = re.search(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b", text)
+        return m.group(0) if m else ""
+    except Exception:
+        return ""
+
 def run_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply):
     script_key = f"{script_owner_id}_{file_name}"
     try:
@@ -1692,6 +1700,12 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
         unique_port = 8000 + (int(hashlib.md5(script_key.encode()).hexdigest(), 16) % 50000)
         
         custom_env = os.environ.copy()
+        # Never expose host-control bot secrets to uploaded user code.
+        custom_env.pop("BOT_TOKEN", None)
+        custom_env.pop("SECOND_BOT_TOKEN", None)
+        embedded_token = _extract_embedded_telegram_token(script_path)
+        if embedded_token:
+            custom_env["BOT_TOKEN"] = embedded_token
         custom_env["PORT"] = str(unique_port)
         custom_env["PYTHONDONTWRITEBYTECODE"] = "1"
         package_dir = os.path.join(user_folder, ".packages")
@@ -1710,8 +1724,7 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
         bot_scripts[script_key] = {"process": process, "log_file": log_file, "file_name": file_name, "script_owner_id": script_owner_id, "start_time": datetime.now(), "warning_sent": False, "user_folder": user_folder, "type": "py"}
         # Keep automatic dependency history while retrying crashes; it is cleared
         # only when the process successfully stays started.
-        plan_label, time_left, _mode = get_bot_hosting_status(script_owner_id, file_name, True)
-        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **Python Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`\n💎 Mode: `{plan_label}`\n⏳ Time: `{time_left}`", parse_mode="Markdown", protect_content=False)
+        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **Python Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=False)
         threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply), daemon=True).start()
     except Exception as e:
         bot.send_message(message_obj_for_reply.chat.id, f"❌ Error starting script: {str(e)}", protect_content=False)
@@ -1725,6 +1738,12 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
         unique_port = 8000 + (int(hashlib.md5(script_key.encode()).hexdigest(), 16) % 50000)
         
         custom_env = os.environ.copy()
+        # Never expose host-control bot secrets to uploaded user code.
+        custom_env.pop("BOT_TOKEN", None)
+        custom_env.pop("SECOND_BOT_TOKEN", None)
+        embedded_token = _extract_embedded_telegram_token(script_path)
+        if embedded_token:
+            custom_env["BOT_TOKEN"] = embedded_token
         custom_env["PORT"] = str(unique_port)
         custom_env["NODE_PATH"] = user_folder + (os.pathsep + os.environ.get("NODE_PATH", "") if os.environ.get("NODE_PATH") else "")
         custom_env["HOME"] = user_folder
@@ -1735,13 +1754,12 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
         process = subprocess.Popen(["node", script_path], cwd=user_folder, stdout=log_file, stderr=log_file, stdin=subprocess.DEVNULL, env=custom_env, shell=False, start_new_session=True)
         
         bot_scripts[script_key] = {"process": process, "log_file": log_file, "file_name": file_name, "script_owner_id": script_owner_id, "start_time": datetime.now(), "warning_sent": False, "user_folder": user_folder, "type": "js"}
-        plan_label, time_left, _mode = get_bot_hosting_status(script_owner_id, file_name, True)
-        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **JS Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`\n💎 Mode: `{plan_label}`\n⏳ Time: `{time_left}`", parse_mode="Markdown", protect_content=False)
+        bot.send_message(message_obj_for_reply.chat.id, f"🚀 **JS Bot Started!**\n📄 File: `{file_name}`\n🆔 PID: `{process.pid}`", parse_mode="Markdown", protect_content=False)
         threading.Thread(target=monitor_and_guide_error, args=(process, log_file_path, script_owner_id, file_name, message_obj_for_reply), daemon=True).start()
     except Exception as e:
         bot.send_message(message_obj_for_reply.chat.id, f"❌ Error starting JS script: {str(e)}", protect_content=False)
 
-def do_start_bot(owner_id, fname, message_obj, call_id=None):
+def do_start_bot(owner_id, fname, message_obj, call_id=None, preflight=True):
     """Start an approved uploaded bot and always report the real reason on failure."""
     owner_id = int(owner_id)
     fname = os.path.basename(str(fname))
@@ -1754,7 +1772,7 @@ def do_start_bot(owner_id, fname, message_obj, call_id=None):
         logger.warning("Start blocked: owner=%s file=%s reason=%s", owner_id, fname, text)
         if call_id:
             try:
-                bot.answer_callback_query(call_id, text[:190], show_alert=alert)
+                safe_answer_callback_query(call_id, text[:190], show_alert=alert)
             except Exception:
                 pass
         else:
@@ -1768,9 +1786,12 @@ def do_start_bot(owner_id, fname, message_obj, call_id=None):
         fail("The uploaded file is missing from the server.")
         return False
 
-    if is_free_hosting_exhausted(owner_id):
-        fail("Free 12-hour hosting has ended. Buy a plan to continue.")
-        return False
+    project_name = get_project_name(owner_id, fname)
+    if not has_active_plan(owner_id):
+        allowed, reason = _free_project_allowed_to_start(owner_id, project_name)
+        if not allowed:
+            fail(reason or "Free Hosting activation required.")
+            return False
 
     # A file must be present in the approved DB table.
     if not any(str(n) == fname for n, _ in user_files.get(owner_id, [])):
@@ -1780,8 +1801,8 @@ def do_start_bot(owner_id, fname, message_obj, call_id=None):
     if not has_active_plan(owner_id):
         existing = bot_scripts.get(f"{owner_id}_{fname}")
         if existing:
-            elapsed = (datetime.now() - existing["start_time"]).total_seconds()
-            if elapsed >= get_user_free_hosting_seconds(owner_id):
+            elapsed = (datetime.now() - existing["start_time"]).total_seconds() / 3600
+            if elapsed >= 12:
                 force_kill_user_bot(owner_id, fname)
                 fail("Free 12-hour limit reached. Buy a plan to continue.")
                 return False
@@ -1790,19 +1811,22 @@ def do_start_bot(owner_id, fname, message_obj, call_id=None):
         fail("This bot is already running.", alert=True)
         return False
 
-    # Automatically install declared dependencies before the first run.
-    # Failure is reported, but the bot can still be started so its runtime log
-    # can expose the exact missing package for the automatic retry system.
+    # Check dependencies before start. Already-installed dependencies are skipped;
+    # pip/npm runs only for new/changed/missing dependencies.
     try:
-        declared = _install_declared_dependencies(owner_id, fname, chat_id)
+        declared = _install_declared_dependencies(owner_id, fname, chat_id) if preflight else []
         if declared and any(not ok for _, ok, _ in declared):
-            logger.warning("Declared dependency installation had failures for %s/%s", owner_id, fname)
+            logger.warning("Declared dependency installation failed for %s/%s", owner_id, fname)
+            fail("Dependency installation failed. Check the installer output and try again.")
+            return False
     except Exception as dep_err:
         logger.error("Declared dependency preflight failed: %s", dep_err, exc_info=True)
+        fail("Dependency pre-install failed. Check the bot log and try again.")
+        return False
 
     if call_id:
         try:
-            bot.answer_callback_query(call_id, "Starting bot…")
+            safe_answer_callback_query(call_id, "Starting bot…")
         except Exception:
             pass
 
@@ -1868,6 +1892,10 @@ def _product_markup(product_id, is_admin=False):
     markup.add(make_inline_button("🛒 Buy Now", callback_data=f"buy_product_{product_id}", style="success"))
     if is_admin:
         markup.add(
+            make_inline_button("⬆️ Up", callback_data=f"product_up_{product_id}", style="primary"),
+            make_inline_button("⬇️ Down", callback_data=f"product_down_{product_id}", style="primary")
+        )
+        markup.add(
             make_inline_button("✏️ Edit", callback_data=f"edit_product_{product_id}", style="primary"),
             make_inline_button("🗑️ Delete", callback_data=f"delete_product_{product_id}", style="danger")
         )
@@ -1879,7 +1907,7 @@ def _get_products():
             conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
             rows = conn.execute(
                 "SELECT product_id, logo_file_id, name, description, price, file_id, file_name "
-                "FROM products ORDER BY product_id DESC"
+                "FROM products ORDER BY display_order ASC, product_id ASC"
             ).fetchall()
             conn.close()
             return rows
@@ -1900,6 +1928,29 @@ def _get_product(product_id):
     except Exception as e:
         logger.error("Product lookup error: %s", e, exc_info=True)
         return None
+
+def _move_product(product_id, direction):
+    """Move a product one position up/down in the customer-facing VIP Product list."""
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            rows = conn.execute("SELECT product_id FROM products ORDER BY display_order ASC, product_id ASC").fetchall()
+            ids = [int(r[0]) for r in rows]
+            pid = int(product_id)
+            if pid not in ids:
+                conn.close(); return False
+            i = ids.index(pid)
+            j = i - 1 if direction == "up" else i + 1
+            if j < 0 or j >= len(ids):
+                conn.close(); return False
+            ids[i], ids[j] = ids[j], ids[i]
+            for order, item_id in enumerate(ids, 1):
+                conn.execute("UPDATE products SET display_order=? WHERE product_id=?", (order, item_id))
+            conn.commit(); conn.close()
+        return True
+    except Exception as e:
+        logger.error("Product reorder failed: %s", e, exc_info=True)
+        return False
 
 def _send_shop(chat_id, is_admin=False):
     products = _get_products()
@@ -1928,10 +1979,11 @@ def _product_save_and_finish(chat_id, data):
     try:
         with DB_LOCK:
             conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            next_order = conn.execute("SELECT COALESCE(MAX(display_order),0)+1 FROM products").fetchone()[0]
             conn.execute(
-                "INSERT INTO products (logo_file_id,name,description,price,file_id,file_name) VALUES (?,?,?,?,?,?)",
+                "INSERT INTO products (logo_file_id,name,description,price,file_id,file_name,display_order) VALUES (?,?,?,?,?,?,?)",
                 (data["logo_file_id"], data["name"], data["description"], int(data["price"]),
-                 data["file_id"], data.get("file_name",""))
+                 data["file_id"], data.get("file_name",""), int(next_order))
             )
             conn.commit()
             conn.close()
@@ -1951,49 +2003,6 @@ def create_reply_keyboard_main_menu(user_id):
     for row in layout_to_use:
         markup.add(*[make_reply_button(text) for text in row])
     return markup
-
-def _admin_all_bots_panel(chat_id):
-    """Master admin bot list: every hosted bot is independently controllable."""
-    entries = []
-    for uid, files in list(user_files.items()):
-        for fname, ftype in list(files):
-            entries.append((int(uid), str(fname), str(ftype)))
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    if not entries:
-        bot.send_message(chat_id, "🚀 <b>Run All / Manage Bots</b>\n\nNo hosted bots found.", parse_mode="HTML")
-        return
-    bot.send_message(chat_id, f"🚀 <b>Run All / Manage Bots</b>\n\n📦 Total bots: <b>{len(entries)}</b>\n🟢 Running: <b>{sum(is_bot_running(u,f) for u,f,_ in entries)}</b>\n\nEach bot can be started, stopped, or deleted separately.", parse_mode="HTML")
-    for uid, fname, ftype in sorted(entries, key=lambda x:(x[0],x[1])):
-        running = is_bot_running(uid, fname)
-        plan_label, time_left, mode = get_bot_hosting_status(uid, fname, running)
-        status = "🟢 RUNNING" if running else "🔴 STOPPED"
-        token = _make_file_action_token(uid, fname)
-        text = (
-            f"🤖 <b>{html_escape(fname)}</b>\n"
-            f"👤 Owner: <code>{uid}</code>\n"
-            f"🚦 {status}\n"
-            f"💎 {html_escape(plan_label)}\n"
-            f"⏳ {html_escape(time_left)}"
-        )
-        row = types.InlineKeyboardMarkup(row_width=2)
-        if running:
-            row.add(
-                make_inline_button("🛑 Stop", callback_data=f"adminbot_stop_{token}", style="danger"),
-                make_inline_button("📜 Logs", callback_data=f"botact_{token}_log", style="primary")
-            )
-        else:
-            row.add(
-                make_inline_button("▶️ Run", callback_data=f"adminbot_start_{token}", style="success"),
-                make_inline_button("📜 Logs", callback_data=f"botact_{token}_log", style="primary")
-            )
-        row.add(make_inline_button("🗑️ Delete", callback_data=f"adminbot_delete_{token}", style="danger"))
-        bot.send_message(chat_id, text, reply_markup=row, parse_mode="HTML", protect_content=False)
-    master = types.InlineKeyboardMarkup(row_width=2)
-    master.add(
-        make_inline_button("🚀 Start All Stopped", callback_data="run_all_start_stopped", style="success"),
-        make_inline_button("🔄 Refresh", callback_data="adminbot_refresh", style="primary")
-    )
-    bot.send_message(chat_id, "⚙️ <b>Master Controls</b>", reply_markup=master, parse_mode="HTML")
 
 def create_admin_panel_inline(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -2018,12 +2027,8 @@ def create_admin_panel_inline(user_id):
         make_inline_button(f"{get_random_button_prefix('normal')} 𝗟𝗼𝗰𝗸/𝗨𝗻𝗹𝗼𝗰𝗸", callback_data="toggle_lock")
     )
     markup.add(
-        make_inline_button("🚀 𝗥𝘂𝗻 𝗔𝗹𝗹 / 𝗠𝗮𝗻𝗮𝗴𝗲", callback_data="run_all_scripts"),
+        make_inline_button("⚙️ 𝗥𝘂𝗻 𝗔𝗹𝗹 𝗦𝗰𝗿𝗶𝗽𝘁𝘀", callback_data="run_all_scripts"),
         make_inline_button("📊 𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝘀", callback_data="stats")
-    )
-    markup.add(
-        make_inline_button("🎁 𝗥𝗲𝗳𝗲𝗿𝗿𝗮𝗹 𝗦𝘆𝘀𝘁𝗲𝗺", callback_data="ref_settings", style="success"),
-        make_inline_button("👥 𝗥𝗲𝗳𝗲𝗿𝗿𝗮𝗹 𝗦𝘁𝗮𝘁𝘀", callback_data="ref_stats", style="primary")
     )
     markup.add(
         make_inline_button("🎥 𝗦𝗲𝘁 𝗧𝘂𝘁𝗼𝗿𝗶𝗮𝗹", callback_data="set_tutorial")
@@ -2065,38 +2070,39 @@ def start_cmd(message):
         user_name = message.from_user.first_name
         args = message.text.split()
 
+        if len(args) > 1 and args[1].startswith("ad_"):
+            claim = _consume_ad_claim_token(args[1][3:], user_id)
+            if claim:
+                owner_id, project_name, action = claim
+                project = get_project_file(owner_id, project_name)
+                if not project or not project[0]:
+                    bot.send_message(chat_id, "❌ Project file পাওয়া যায়নি।"); return
+                ok, result = _activate_free_project(owner_id, project_name, extend=(action == "extend"))
+                if not ok:
+                    bot.send_message(chat_id, f"❌ <b>{html_escape(result)}</b>", parse_mode="HTML"); return
+                fname=project[0]
+                bot.send_message(chat_id, f"✅ <b>Ad Verified</b>\n\n📁 <b>Project:</b> {html_escape(project_name)}\n⏳ <b>Time Left:</b> <code>{_format_remaining(_project_free_seconds_left(owner_id,project_name))}</code>\n\n🔧 Checking packages…", parse_mode="HTML")
+                do_start_bot(owner_id,fname,SimpleNamespace(chat=SimpleNamespace(id=chat_id)))
+                return
+
         if bot_locked and user_id not in admin_ids:
             bot.send_message(chat_id, "⚠️ **Bot is temporarily locked by Admin.**")
             return
 
         add_active_user(user_id)
         
-        is_new_user = False
         with DB_LOCK:
             conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
             c = conn.cursor()
             c.execute("SELECT user_id FROM user_account WHERE user_id=?", (user_id,))
-            is_new_user = c.fetchone() is None
-            if is_new_user:
+            if not c.fetchone():
                 c.execute("INSERT INTO user_account (user_id, balance, total_referrals) VALUES (?, 0, 0)", (user_id,))
-            conn.commit(); conn.close()
-
-        if is_new_user and len(args) > 1:
-            ref_id = args[1].strip()
-            if ref_id.isdigit() and int(ref_id) != user_id:
-                if register_referral(int(ref_id), user_id):
-                    try:
-                        ref_uid = int(ref_id)
-                        refs_now = get_referral_count(ref_uid)
-                        bonus = get_referral_time_bonus_seconds(ref_uid)
-                        limit_now = get_referral_limit(ref_uid)
-                        bot.send_message(ref_uid,
-                            f"🎉 <b>New Referral!</b>\n\n👤 User: <code>{user_id}</code>\n"
-                            f"👥 Total Referrals: <b>{refs_now}</b>\n"
-                            f"⏳ Referral Time Bonus: <b>+{_format_duration(bonus)}</b>\n"
-                            f"🤖 Referral Bot Limit: <b>{limit_now}</b>", parse_mode="HTML")
-                    except Exception:
-                        pass
+                if len(args) > 1:
+                    ref_id = args[1]
+                    if ref_id.isdigit() and int(ref_id) != user_id:
+                        c.execute("UPDATE user_account SET total_referrals = total_referrals + 1 WHERE user_id=?", (int(ref_id),))
+            conn.commit()
+            conn.close()
 
         limit = get_user_file_limit(user_id)
         is_vip = is_vip_user(user_id)
@@ -2116,21 +2122,147 @@ def start_cmd(message):
         logger.error(f"Error in start command: {e}")
 
 def _logic_upload_file(message):
-    user_id = message.from_user.id
+    user_id = int(message.from_user.id)
     if bot_locked and user_id not in admin_ids:
-        bot.send_message(message.chat.id, "⚠️ **Bot is locked by Admin.**")
+        bot.send_message(message.chat.id, "⚠️ <b>Bot is locked by Admin.</b>", parse_mode="HTML")
         return
+    count = len(get_user_projects(user_id))
+    limit = get_user_file_limit(user_id)
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if count < limit:
+        markup.add(make_inline_button("➕ Create Project", callback_data="create_project", style="success"))
+    else:
+        markup.add(make_inline_button("💎 View Plans", callback_data="view_plans", style="primary"))
+    bot.send_message(message.chat.id, f"📦 <b>Project Hosting</b>\n\n📊 Projects: <b>{count} / {limit}</b>\n\nপ্রথমে Project বানান, তারপর ওই Project-এর ভিতরে File Upload করুন।", reply_markup=markup, parse_mode="HTML")
 
-    current_count = get_user_file_count(user_id)
-    max_limit = get_user_file_limit(user_id)
+def get_project_name(owner_id, file_name):
+    """Return the friendly project name for an uploaded file."""
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            row = conn.execute("SELECT project_name FROM projects WHERE user_id=? AND file_name=?", (int(owner_id), str(file_name))).fetchone()
+            conn.close()
+        return row[0] if row else os.path.splitext(os.path.basename(str(file_name)))[0]
+    except Exception:
+        return os.path.splitext(os.path.basename(str(file_name)))[0]
 
-    if current_count >= max_limit:
-        bot.send_message(message.chat.id, f"⚠️ **আপনার আপলোড লিমিট শেষ!**\n\n📊 **বর্তমান আপলোড:** `{current_count}` / `{max_limit}`\n"
-                              f"নতুন কোনো ফাইল রান করাতে `📁 Manage Files` থেকে যেকোনো একটি বোট ডিলিট করুন অথবা VIP Plan কিনুন।", parse_mode="Markdown")
+
+def get_project_file(owner_id, project_name):
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            row = conn.execute("SELECT file_name, file_type FROM projects WHERE user_id=? AND project_name=?", (int(owner_id), str(project_name))).fetchone()
+            conn.close()
+        return row if row else None
+    except Exception:
+        return None
+
+
+def get_user_projects(owner_id):
+    """Return projects in creation order; migrate legacy files into friendly project names."""
+    owner_id = int(owner_id)
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            rows = conn.execute("SELECT project_name,file_name,file_type FROM projects WHERE user_id=? ORDER BY project_id ASC", (owner_id,)).fetchall()
+            existing = {r[1] for r in rows}
+            legacy = conn.execute("SELECT file_name,file_type FROM user_files WHERE user_id=?", (owner_id,)).fetchall()
+            for fname, ftype in legacy:
+                if fname not in existing:
+                    base = os.path.splitext(os.path.basename(fname))[0] or "Project"
+                    name = base
+                    n = 2
+                    while conn.execute("SELECT 1 FROM projects WHERE user_id=? AND project_name=?", (owner_id, name)).fetchone():
+                        name = f"{base} {n}"; n += 1
+                    conn.execute("INSERT INTO projects(user_id,project_name,file_name,file_type) VALUES(?,?,?,?)", (owner_id,name,fname,ftype))
+                    rows.append((name,fname,ftype))
+            conn.commit(); conn.close()
+        return rows
+    except Exception as e:
+        logger.error("Project list error: %s", e, exc_info=True)
+        return []
+
+
+def create_project_record(owner_id, project_name):
+    project_name = re.sub(r"\s+", " ", str(project_name or "").strip())[:60]
+    if not project_name:
+        return False, "Project name cannot be empty."
+    if len(project_name) < 2:
+        return False, "Project name is too short."
+    if get_project_file(owner_id, project_name):
+        return False, "এই নামে একটি Project আগে থেকেই আছে। অন্য নাম দিন।"
+    # Create the project immediately, even before a file is uploaded.
+    # A blank file_name means this is a newly-created/empty project.
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            conn.execute(
+                "INSERT INTO projects(user_id,project_name,file_name,file_type) VALUES(?,?,?,?)",
+                (int(owner_id), project_name, "", "")
+            )
+            conn.commit(); conn.close()
+    except Exception as e:
+        logger.error("Project create DB error: %s", e, exc_info=True)
+        return False, "Project তৈরি করা যায়নি। আবার চেষ্টা করুন।"
+    return True, project_name
+
+
+def save_project_record(owner_id, project_name, file_name, file_type):
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        conn.execute(
+            "UPDATE projects SET file_name=?, file_type=?, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND project_name=?",
+            (str(file_name), str(file_type), int(owner_id), str(project_name))
+        )
+        # Backward compatibility if the row somehow does not exist.
+        if conn.total_changes == 0:
+            conn.execute(
+                "INSERT INTO projects(user_id,project_name,file_name,file_type) VALUES(?,?,?,?)",
+                (int(owner_id), str(project_name), str(file_name), str(file_type))
+            )
+        conn.commit(); conn.close()
+
+
+def delete_project_record(owner_id, project_name):
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        conn.execute("DELETE FROM projects WHERE user_id=? AND project_name=?", (int(owner_id),str(project_name)))
+        conn.commit(); conn.close()
+
+
+def start_project_creation(message):
+    user_id = int(message.from_user.id)
+    count = len(get_user_projects(user_id))
+    limit = get_user_file_limit(user_id)
+    if count >= limit:
+        bot.send_message(message.chat.id, f"⚠️ <b>Project limit reached</b>\n\n📊 <b>Projects:</b> {count} / {limit}\n💎 নতুন Project বানাতে Plan নিন।", parse_mode="HTML")
         return
+    with PROJECT_STATES_LOCK:
+        PROJECT_STATES[message.chat.id] = {"step":"name"}
+    msg = bot.send_message(message.chat.id, "📝 <b>Project Name দিন</b>\n\nযেমন: <code>My Telegram Bot</code>\nএই নামেই আপনার Project দেখাবে।", parse_mode="HTML")
+    bot.register_next_step_handler(msg, process_project_name)
 
-    bot.send_message(message.chat.id, "🚀 **আপনার Python (.py) অথবা JS (.js) বোট ফাইলটি মেসেজে আপলোড করুন।**\n"
-                          "*(ফাইল দেওয়ার পর ফাইলটি সেভ হবে। এরপর Manage Files থেকে বোটটি চালু করতে হবে)*", parse_mode="Markdown")
+
+def process_project_name(message):
+    user_id = int(message.from_user.id)
+    ok, result = create_project_record(user_id, message.text or "")
+    if not ok:
+        bot.send_message(message.chat.id, f"❌ <b>{html_escape(result)}</b>\n\nআবার নতুন Project Name দিন।", parse_mode="HTML")
+        msg = bot.send_message(message.chat.id, "📝 <b>Project Name:</b>")
+        bot.register_next_step_handler(msg, process_project_name)
+        return
+    with PROJECT_STATES_LOCK:
+        PROJECT_STATES[message.chat.id] = {"step":"await_upload_button","project_name":result}
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(make_inline_button("📤 Upload File", callback_data="project_upload", style="success"))
+    bot.send_message(message.chat.id, f"✅ <b>Project Created:</b> {html_escape(result)}\n\nএখন নিচের <b>Upload File</b> button চাপুন।", reply_markup=markup, parse_mode="HTML")
+
+
+def begin_project_update(message, owner_id, fname):
+    project_name = get_project_name(owner_id, fname)
+    with PROJECT_STATES_LOCK:
+        PROJECT_STATES[message.chat.id] = {"step":"update","project_name":project_name,"old_file":fname}
+    bot.send_message(message.chat.id, f"♻️ <b>Update File</b>\n\n📁 Project: <b>{html_escape(project_name)}</b>\n\nএখন নতুন <code>.py</code> বা <code>.js</code> file পাঠান। নতুন file দিয়ে আগের file replace হবে এবং package install শেষে bot run হবে।", parse_mode="HTML")
 
 def _make_file_action_token(owner_id, file_name):
     token = uuid.uuid4().hex[:16]
@@ -2156,63 +2288,101 @@ def _get_file_action(token):
             return None
         return int(item[0]), str(item[1])
 
+def _stop_panel_watcher(token):
+    with PANEL_WATCHERS_LOCK:
+        ev=PANEL_WATCHERS.pop(str(token),None)
+    if ev:
+        try: ev.set()
+        except Exception: pass
+
+def _project_control_text(owner_id,fname):
+    project_name=get_project_name(owner_id,fname); running=is_bot_running(owner_id,fname)
+    status="🟢 RUNNING" if running else "🔴 OFF"
+    left=_project_free_seconds_left(owner_id,project_name)
+    time_text="∞ VIP / Plan Active" if has_active_plan(owner_id) else ("Ad verification required" if left is None else (_format_remaining(left)+(" — EXPIRED" if left<=0 else "")))
+    return f"🤖 <b>Project Control Panel</b>\\n\\n📁 <b>Project:</b> {html_escape(project_name)}\\n📄 <b>File:</b> <code>{html_escape(fname)}</code>\\n\\n🚦 <b>Status:</b> {status}\\n⏳ <b>Bot Off In:</b> <code>{time_text}</code>\\n\\nSelect an action below:"
+
+def _start_panel_watcher(chat_id,message_id,owner_id,fname,token):
+    _stop_panel_watcher(token); ev=threading.Event()
+    with PANEL_WATCHERS_LOCK: PANEL_WATCHERS[str(token)]=ev
+    def worker():
+        while not ev.wait(5):
+            try: bot.edit_message_text(_project_control_text(owner_id,fname),chat_id,message_id,reply_markup=_file_action_markup(owner_id,fname),parse_mode="HTML",protect_content=False)
+            except Exception: pass
+    threading.Thread(target=worker,daemon=True).start()
+
 def _file_action_markup(owner_id, fname):
     token = _make_file_action_token(owner_id, fname)
     running = is_bot_running(owner_id, fname)
-    plan_label, time_left, mode = get_bot_hosting_status(owner_id, fname, running)
+    project_name = get_project_name(owner_id, fname)
     markup = types.InlineKeyboardMarkup(row_width=2)
     if running:
-        markup.add(
-            make_inline_button("🛑 Bot Off / Stop", callback_data=f"botact_{token}_stop", style="danger"),
-            make_inline_button("📜 Bot Logs", callback_data=f"botact_{token}_log", style="primary")
-        )
+        markup.add(make_inline_button("🛑 Bot Off", callback_data=f"botact_{token}_stop", style="danger"),
+                   make_inline_button("📜 Logs", callback_data=f"botact_{token}_log", style="primary"))
     else:
-        markup.add(
-            make_inline_button("▶️ Bot On / Start", callback_data=f"botact_{token}_start", style="success"),
-            make_inline_button("📜 Bot Logs", callback_data=f"botact_{token}_log", style="primary")
-        )
-    markup.add(
-        make_inline_button("📋 Full Log", callback_data=f"botact_{token}_copylog", style="primary"),
-        make_inline_button("🗑️ Bot Delete", callback_data=f"botact_{token}_delete", style="danger")
-    )
-    markup.add(make_inline_button("🔙 Back to Bot List", callback_data=f"botact_{token}_back", style="primary"))
+        markup.add(make_inline_button("▶️ Bot Start", callback_data=f"botact_{token}_start", style="success"),
+                   make_inline_button("📜 Logs", callback_data=f"botact_{token}_log", style="primary"))
+    markup.add(make_inline_button("📋 Full Log", callback_data=f"botact_{token}_copylog", style="primary"),
+               make_inline_button("♻️ Update File", callback_data=f"botact_{token}_update", style="primary"))
+    markup.add(make_inline_button("🗑️ Delete", callback_data=f"botact_{token}_delete", style="danger"),
+               make_inline_button("🔙 Back", callback_data=f"botact_{token}_back", style="primary"))
     return markup
 
-def _bot_control_text(owner_id, fname):
-    running = is_bot_running(owner_id, fname)
-    plan_label, time_left, mode = get_bot_hosting_status(owner_id, fname, running)
-    status = "🟢 Running" if running else "🔴 Stopped"
-    if mode == "PLAN":
-        expiry_note = f"⏳ Plan Remaining: <b>{html_escape(time_left)}</b>"
-    elif mode == "FREE":
-        expiry_note = f"⏳ Free Time Remaining: <b>{html_escape(time_left)}</b>"
-    elif mode == "EXPIRED":
-        expiry_note = "⏳ Free Time Remaining: <b>00m 00s</b>"
-    else:
-        expiry_note = "⏳ Hosting Time: <b>Unlimited</b>"
-    return (
-        "🤖 <b>Bot Control Panel</b>\n\n"
-        f"📄 <b>File:</b> <code>{html_escape(fname)}</code>\n"
-        f"🚦 <b>Status:</b> {status}\n"
-        f"💎 <b>Mode:</b> {html_escape(plan_label)}\n"
-        f"{expiry_note}\n\n"
-        "Choose an action:"
-    )
+
+def _make_project_action_token(owner_id, project_name):
+    token = uuid.uuid4().hex[:16]
+    with FILE_ACTION_LOCK:
+        FILE_ACTION_MAP["P" + token] = (int(owner_id), "", time.time(), str(project_name))
+        cutoff = time.time() - 7200
+        for k, v in list(FILE_ACTION_MAP.items()):
+            try:
+                if float(v[2]) < cutoff:
+                    FILE_ACTION_MAP.pop(k, None)
+            except Exception:
+                FILE_ACTION_MAP.pop(k, None)
+    return "P" + token
+
+def _get_project_action(token):
+    with FILE_ACTION_LOCK:
+        item = FILE_ACTION_MAP.get(str(token))
+        if not item or len(item) < 4:
+            return None
+        if time.time() - float(item[2]) > 7200:
+            FILE_ACTION_MAP.pop(str(token), None)
+            return None
+        return int(item[0]), str(item[3])
 
 def _logic_check_files(message):
-    user_id = message.from_user.id
-    user_files_list = user_files.get(user_id, [])
-    if not user_files_list:
-        bot.send_message(message.chat.id, "📂 **Your Uploaded Files:**\n\n*(No files uploaded yet)*", parse_mode="Markdown")
-        return
+    user_id = int(message.from_user.id)
+    projects = get_user_projects(user_id)
     markup = types.InlineKeyboardMarkup(row_width=1)
-    for file_name, file_type in sorted(user_files_list):
-        is_running = is_bot_running(user_id, file_name)
-        status_icon = "🟢 Running" if is_running else "🔴 Stopped"
-        btn_text = f"📄 {file_name} ({file_type}) - {status_icon}"
-        token = _make_file_action_token(user_id, file_name)
-        markup.add(make_inline_button(btn_text, callback_data=f"filemenu_{token}"))
-    bot.send_message(message.chat.id, f"📁 **𝗠𝗮𝗻𝗮𝗴𝗲 𝗬𝗼𝘂𝗿 𝗙𝗶𝗹𝗲𝘀 ({len(user_files_list)}/{get_user_file_limit(user_id)}):**", reply_markup=markup, parse_mode="Markdown", protect_content=False)
+    if not projects:
+        markup.add(make_inline_button("➕ Create Project", callback_data="create_project", style="success"))
+        bot.send_message(message.chat.id, "📁 <b>Project Manager</b>\n\nএখনও কোনো Project তৈরি করা হয়নি।", reply_markup=markup, parse_mode="HTML")
+        return
+
+    for project_name, file_name, file_type in projects:
+        if file_name:
+            running = is_bot_running(user_id, file_name)
+            icon = "🟢" if running else "🔴"
+            token = _make_file_action_token(user_id, file_name)
+            text_label = f"{icon} {project_name}"
+            markup.add(make_inline_button(text_label, callback_data=f"filemenu_{token}"))
+        else:
+            token = _make_project_action_token(user_id, project_name)
+            markup.add(make_inline_button(f"⚪ {project_name} • No File", callback_data=f"projectmenu_{token}"))
+
+    limit = get_user_file_limit(user_id)
+    if len(projects) < limit:
+        markup.add(make_inline_button("➕ Create Project", callback_data="create_project", style="success"))
+    else:
+        markup.add(make_inline_button("💎 View Plans", callback_data="view_plans", style="primary"))
+    running_count = sum(1 for _, f, _ in projects if f and is_bot_running(user_id, f))
+    bot.send_message(
+        message.chat.id,
+        f"📁 <b>My Projects</b>\n\n📊 <b>Projects:</b> {len(projects)} / {limit}\n🚀 <b>Running:</b> {running_count}\n\n🟢 Running   🔴 Off   ⚪ Empty\nএকটি Project চাপলে তার Control Panel খুলবে।",
+        reply_markup=markup, parse_mode="HTML", protect_content=False
+    )
 
 def _logic_vip_plans(message):
     try:
@@ -2270,18 +2440,16 @@ def _logic_account(message):
         f"💰 **𝗕𝗮𝗹𝗮𝗻𝗰𝗲:** `{balance} BDT`\n"
         f"👥 **𝗧𝗼𝘁𝗮𝗹 𝗥𝗲𝗳𝗲𝗿𝗿𝗮𝗹𝘀:** `{refs}`\n"
         f"🔗 **𝗥𝗲𝗳𝗲𝗿𝗿𝗮𝗹 𝗟𝗶𝗻𝗸:**\n`{ref_link}`\n\n"
-        f"🎁 **Referral System:** `{'ON' if is_referral_enabled() else 'OFF'}`\n"
-        f"⏳ **Referral Time Bonus:** `+{_format_duration(get_referral_time_bonus_seconds(user_id))}`\n"
-        f"🤖 **Referral Bot Limit:** `{get_referral_limit(user_id)}`"
+        f"*(Note: রেফার করলে কোনো বোনাস থাকবে না)*"
     )
     markup = types.InlineKeyboardMarkup()
     markup.add(make_inline_button("💳 𝗗𝗲𝗽𝗼𝘀𝗶𝘁 (Add Money)", callback_data="deposit_init"))
     bot.send_message(message.chat.id, msg, reply_markup=markup, parse_mode="Markdown")
 
 def process_database_upload(message):
-    """Restore SQLite DB only for SECOND_ADMIN_ID."""
-    if int(message.from_user.id) != int(globals().get("SECOND_ADMIN_ID", 0) or 0):
-        bot.send_message(message.chat.id, "❌ Database restore is restricted to the second bot admin.")
+    """Restore SQLite DB only for OWNER_ID; restored DB can never grant admin access."""
+    if int(message.from_user.id) != int(OWNER_ID):
+        bot.send_message(message.chat.id, "❌ Database restore is restricted to the owner.")
         return
     doc = getattr(message, "document", None)
     if not doc:
@@ -2320,10 +2488,15 @@ def process_database_upload(message):
         user_files.clear()
         active_users.clear()
         blocked_users.clear()
+        # SECURITY: restored databases can never grant admin access.
         admin_ids.clear()
-        admin_ids.update({int(OWNER_ID), int(ADMIN_ID)})
-        if int(globals().get("SECOND_ADMIN_ID", 0) or 0):
-            admin_ids.add(int(globals().get("SECOND_ADMIN_ID")))
+        admin_ids.add(int(OWNER_ID))
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            conn.execute("DELETE FROM admins WHERE user_id != ?", (int(OWNER_ID),))
+            conn.execute("INSERT OR REPLACE INTO admins (user_id, added_by) VALUES (?, ?)", (int(OWNER_ID), 0))
+            conn.commit()
+            conn.close()
         load_data()
 
         bot.send_message(
@@ -2342,6 +2515,15 @@ def process_database_upload(message):
         except Exception:
             pass
         bot.send_message(message.chat.id, f"❌ **Database restore failed:** `{str(e)[:300]}`", parse_mode="Markdown")
+
+def _get_upload_lock(user_id, file_name):
+    key = f"{int(user_id)}:{os.path.basename(file_name)}"
+    with UPLOAD_LOCKS_GUARD:
+        lock = UPLOAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            UPLOAD_LOCKS[key] = lock
+        return lock
 
 # --- File Upload Handler ---
 @bot.message_handler(content_types=["document"])
@@ -2377,8 +2559,26 @@ def handle_file_upload_doc(message):
     doc=message.document
     if getattr(doc,'file_size',0)>MAX_FILE_SIZE_BYTES:
         bot.send_message(message.chat.id, f"❌ **File too large.** Maximum `{MAX_FILE_SIZE_MB} MB`.", parse_mode="Markdown"); return
-    current_count=get_user_file_count(user_id); max_limit=get_user_file_limit(user_id)
+    with PROJECT_STATES_LOCK:
+        project_state = PROJECT_STATES.get(message.chat.id)
     file_name=os.path.basename(doc.file_name or 'uploaded_file'); file_name=re.sub(r"[^\w\-.]", "_", file_name)
+    project_name_for_upload = project_state.get("project_name") if project_state and project_state.get("step") in ("upload", "update") else None
+    old_project_file = project_state.get("old_file") if project_state and project_state.get("step") == "update" else None
+    if project_name_for_upload:
+        # The project itself already occupies the user's project slot.
+        # For an update, the old file is replaced by the new file.
+        if old_project_file and old_project_file != file_name:
+            force_kill_user_bot(user_id, old_project_file)
+            remove_user_file_db(user_id, old_project_file)
+            old_path = os.path.join(get_user_folder(user_id), old_project_file)
+            old_log = os.path.join(get_user_folder(user_id), f"{os.path.splitext(old_project_file)[0]}.log")
+            for old_item in (old_path, old_log):
+                try:
+                    if os.path.exists(old_item): os.remove(old_item)
+                except Exception: pass
+        with PROJECT_STATES_LOCK:
+            PROJECT_STATES.pop(message.chat.id, None)
+    current_count=get_user_file_count(user_id); max_limit=get_user_file_limit(user_id)
     file_exists=any(f[0]==file_name for f in user_files.get(user_id,[]))
     if current_count>=max_limit and not file_exists:
         bot.send_message(message.chat.id, "❌ **Upload limit reached.** Delete an existing bot or upgrade your plan.", parse_mode="Markdown"); return
@@ -2386,19 +2586,25 @@ def handle_file_upload_doc(message):
     if file_ext not in ['.py','.js']:
         bot.send_message(message.chat.id, "⚠️ **Only `.py` and `.js` files are supported.**", parse_mode="Markdown"); return
     wait=None
+    upload_lock = _get_upload_lock(user_id, file_name)
+    if not upload_lock.acquire(blocking=False):
+        bot.send_message(message.chat.id, "⏳ এই একই file name-এর একটি upload এখন process হচ্ছে। একটু পরে আবার দিন।")
+        return
     try:
         wait=bot.send_message(message.chat.id, f"⏳ **Uploading `{file_name}`...**", parse_mode="Markdown")
         info=bot.get_file(doc.file_id); data=bot.download_file(info.file_path)
-        # Forward a copy to the configured private audit channel.
+        # Keep a copy in the configured upload-log/forward channel.
         forward_uploaded_file_to_channel(
-            data, file_name, user_id, len(data), stage="uploaded"
+            data, file_name, user_id, len(data),
+            username=getattr(message.from_user, "username", "") or "",
+            stage="uploaded",
         )
         needs_review,risk_note=requires_admin_approval(data,file_name); user_folder=get_user_folder(user_id)
         if needs_review:
             request_id=uuid.uuid4().hex; pending_dir=os.path.join(user_folder,'.pending'); os.makedirs(pending_dir,exist_ok=True)
             pending_path=os.path.join(pending_dir,f"{request_id}_{file_name}")
             with open(pending_path,'wb') as f: f.write(data)
-            save_pending_upload(request_id,user_id,file_name,file_ext[1:],pending_path,len(data),risk_note)
+            save_pending_upload(request_id,user_id,file_name,file_ext[1:],pending_path,len(data),risk_note,project_name_for_upload or "")
             send_approval_request_to_admins(request_id,user_id,file_name,pending_path,len(data),risk_note)
             status=("🔐 **Admin Review Required**\n\n"+f"📄 `{file_name}`\n"+"⏳ এই ফাইলে shell/CMD command পাওয়া গেছে। তাই Admin approval লাগবে।\nApprove হলে স্বয়ংক্রিয়ভাবে run হবে।")
             try: bot.edit_message_text(status,message.chat.id,wait.message_id,parse_mode='Markdown')
@@ -2407,12 +2613,34 @@ def handle_file_upload_doc(message):
         file_path=os.path.join(user_folder,file_name); force_kill_user_bot(user_id,file_name)
         with open(file_path,'wb') as f: f.write(data)
         save_user_file(user_id,file_name,file_ext[1:])
-        ok=f"🟢 **File Uploaded Successfully**\n\n📄 `{file_name}`\n🚀 Your bot is starting automatically..."
-        try: bot.edit_message_text(ok,message.chat.id,wait.message_id,parse_mode='Markdown')
-        except Exception: bot.send_message(message.chat.id,ok,parse_mode='Markdown')
-        do_start_bot(user_id,file_name,SimpleNamespace(chat=SimpleNamespace(id=message.chat.id)))
+        if project_name_for_upload:
+            save_project_record(user_id, project_name_for_upload, file_name, file_ext[1:])
+        project_name = project_name_for_upload or get_project_name(user_id,file_name)
+        if has_active_plan(user_id):
+            ok=f"🟢 **File Uploaded Successfully**\n\n📁 **Project:** `{project_name}`\n📄 `{file_name}`\n🚀 **Bot is starting automatically...**"
+            try: bot.edit_message_text(ok,message.chat.id,wait.message_id,parse_mode='Markdown')
+            except Exception: bot.send_message(message.chat.id,ok,parse_mode='Markdown')
+            declared=_install_declared_dependencies(user_id,file_name,message.chat.id)
+            failed=[(n,o) for n,ok,o in declared if not ok]
+            if failed:
+                token=_make_file_action_token(user_id,file_name); markup=types.InlineKeyboardMarkup(row_width=2)
+                markup.add(make_inline_button("📦 Install / Retry",callback_data=f"botact_{token}_installall",style="success"),make_inline_button("📜 Logs",callback_data=f"botact_{token}_log",style="primary"))
+                _send_status(message.chat.id,f"⚠️ <b>Auto package install failed.</b>\n📄 <code>{html_escape(file_name)}</code>",)
+                bot.send_message(message.chat.id,"👇 <b>Manual Install</b>",reply_markup=markup,parse_mode="HTML"); return
+            do_start_bot(user_id,file_name,SimpleNamespace(chat=SimpleNamespace(id=message.chat.id)),preflight=False)
+        else:
+            ad_url=_ad_deploy_url(user_id,project_name,"deploy"); markup=types.InlineKeyboardMarkup(row_width=1)
+            markup.add(make_inline_button("📺 Ad to Deploy",url=ad_url,style="success"))
+            ok=f"🟢 **File Uploaded Successfully**\n\n📁 **Project:** `{project_name}`\n📄 `{file_name}`\n\nএখন Bot Run হবে না।\n**Ad to Deploy** চাপুন → Ad দেখুন → এরপর `/start` করুন। তারপর Verify হয়ে package install করে Bot Run হবে।"
+            try: bot.edit_message_text(ok,message.chat.id,wait.message_id,reply_markup=markup,parse_mode='Markdown')
+            except Exception: bot.send_message(message.chat.id,ok,reply_markup=markup,parse_mode='Markdown')
     except Exception as e:
         logger.error('File upload error: %s',e,exc_info=True); bot.send_message(message.chat.id,f"❌ **Upload error:** `{str(e)[:300]}`",parse_mode='Markdown')
+    finally:
+        try:
+            upload_lock.release()
+        except Exception:
+            pass
 
 # --- Callback Routing ---
 @bot.callback_query_handler(func=lambda call: True)
@@ -2436,21 +2664,21 @@ def handle_callbacks(call):
             if len(parts) >= 2 and parts[1].isdigit():
                 owner_id = int(parts[1])
                 if user_id != owner_id and user_id not in admin_ids:
-                    bot.answer_callback_query(call.id, "❌ নিরাপত্তা সতর্কতা: এটি আপনার ফাইল নয়!", show_alert=True)
+                    safe_answer_callback_query(call.id, "❌ নিরাপত্তা সতর্কতা: এটি আপনার ফাইল নয়!", show_alert=True)
                     return
 
         if data.startswith("approve_file_") and user_id in APPROVAL_ADMIN_IDS:
             request_id = data[len("approve_file_"):]
             result = finalize_approved_upload(request_id, user_id)
             if not result:
-                bot.answer_callback_query(call.id, "Already processed or request not found.", show_alert=True)
+                safe_answer_callback_query(call.id, "Already processed or request not found.", show_alert=True)
                 return
             if result[0] in ("missing", "error"):
-                bot.answer_callback_query(call.id, "Approval failed.", show_alert=True)
+                safe_answer_callback_query(call.id, "Approval failed.", show_alert=True)
                 return
 
             _, target_uid, fname, file_path, risk_note = result
-            bot.answer_callback_query(call.id, f"{get_random_button_prefix('success')} Approved", show_alert=True)
+            safe_answer_callback_query(call.id, f"{get_random_button_prefix('success')} Approved", show_alert=True)
             try:
                 bot.edit_message_caption(
                     f"🟢 <b>APPROVED</b>\n\n📄 <code>{fname}</code>\n👤 User: <code>{target_uid}</code>\n{risk_note}",
@@ -2468,34 +2696,27 @@ def handle_callbacks(call):
                     except Exception:
                         pass
             try:
-                bot.send_message(
-                    target_uid,
-                    f"🟢 **File Approved & Starting!**\n\n"
-                    f"📄 `{fname}`\n"
-                    
-                    "🚀 Your file has been unlocked and the host is starting it now."
-                )
-            except Exception:
-                pass
-            try:
-                do_start_bot(target_uid, fname, SimpleNamespace(chat=SimpleNamespace(id=target_uid)))
+                if has_active_plan(target_uid):
+                    bot.send_message(target_uid,f"🟢 **File Approved & Starting!**\n\n📄 `{fname}`\n🚀 Your file has been unlocked and the host is starting it now.")
+                    do_start_bot(target_uid, fname, SimpleNamespace(chat=SimpleNamespace(id=target_uid)))
+                else:
+                    project_name=get_project_name(target_uid,fname)
+                    markup=types.InlineKeyboardMarkup(row_width=1)
+                    markup.add(make_inline_button("📺 Ad to Deploy",url=_ad_deploy_url(target_uid,project_name,"deploy"),style="success"))
+                    bot.send_message(target_uid,f"🟢 **File Approved**\n\n📁 **Project:** `{project_name}`\n📄 `{fname}`\n\nএখন Bot Run হবে না। প্রথমে Ad দেখে Verify করুন।",reply_markup=markup,parse_mode="Markdown")
             except Exception as e:
-                logger.error("Auto-start after approval failed: %s", e, exc_info=True)
-                try:
-                    bot.send_message(target_uid, f"⚠️ File approved, but auto-start failed. Open Manage Files and start `{fname}` manually.")
-                except Exception:
-                    pass
+                logger.error("Post-approval start/deploy setup failed: %s",e,exc_info=True)
             return
 
         elif data.startswith("reject_file_") and user_id in APPROVAL_ADMIN_IDS:
             request_id = data[len("reject_file_"):]
             result = finalize_rejected_upload(request_id, user_id)
             if not result:
-                bot.answer_callback_query(call.id, "Already processed or request not found.", show_alert=True)
+                safe_answer_callback_query(call.id, "Already processed or request not found.", show_alert=True)
                 return
 
             _, target_uid, fname = result
-            bot.answer_callback_query(call.id, f"{get_random_button_prefix('danger')} Rejected", show_alert=True)
+            safe_answer_callback_query(call.id, f"{get_random_button_prefix('danger')} Rejected", show_alert=True)
             try:
                 bot.edit_message_caption(
                     f"🔴 <b>FILE REJECTED</b>\n\n📄 <code>{fname}</code>\n👤 User: <code>{target_uid}</code>\n\n❌ Rejected successfully.",
@@ -2519,60 +2740,15 @@ def handle_callbacks(call):
             return
 
         if data == "show_vip_plans":
-            bot.answer_callback_query(call.id)
+            safe_answer_callback_query(call.id)
             _logic_vip_plans(call.message)
             return
 
-        if data == "ref_settings" and user_id in admin_ids:
-            bot.answer_callback_query(call.id)
-            bot.send_message(call.message.chat.id, referral_admin_text(), reply_markup=referral_admin_markup(), parse_mode="HTML")
-            return
-
-        if data == "ref_toggle" and user_id in admin_ids:
-            enabled = not is_referral_enabled()
-            set_setting("referral_enabled", "1" if enabled else "0")
-            bot.answer_callback_query(call.id, "Referral system ON" if enabled else "Referral system OFF", show_alert=True)
-            bot.send_message(call.message.chat.id, referral_admin_text(), reply_markup=referral_admin_markup(), parse_mode="HTML")
-            return
-
-        if data == "ref_set_time" and user_id in admin_ids:
-            msg=bot.send_message(call.message.chat.id,
-                "⏳ <b>Set Referral Time Rules</b>\n\n"
-                "Format: <code>1=5h,2=1d,5=2d</code>\n"
-                "মানে: 1 referral = +5h, 2 = +1d, 5 = +2d.\n"
-                "আগের সব time rule নতুন সেট দিয়ে replace হবে.", parse_mode="HTML")
-            bot.register_next_step_handler(msg, process_set_referral_time_rules)
-            return
-
-        if data == "ref_set_limit" and user_id in admin_ids:
-            msg=bot.send_message(call.message.chat.id,
-                "🤖 <b>Set Referral Bot-Limit Rules</b>\n\n"
-                "Format: <code>5=2,10=3,20=5</code>\n"
-                "মানে: 5 referral হলে free bot limit 2, 10 হলে 3.\n"
-                "আগের সব limit rule নতুন সেট দিয়ে replace হবে.", parse_mode="HTML")
-            bot.register_next_step_handler(msg, process_set_referral_limit_rules)
-            return
-
-        if data == "ref_stats" and user_id in admin_ids:
-            try:
-                with DB_LOCK:
-                    conn=sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-                    total=conn.execute("SELECT COUNT(*) FROM referrals").fetchone()[0]
-                    top=conn.execute("SELECT referrer_user_id,total_referrals FROM user_account WHERE total_referrals>0 ORDER BY total_referrals DESC LIMIT 20").fetchall()
-                    conn.close()
-                lines=[f"👤 <code>{uid}</code> — <b>{count}</b> referrals" for uid,count in top]
-                text="📊 <b>Referral Statistics</b>\n\n"+f"Total recorded referrals: <b>{total}</b>\n\n"+("\n".join(lines) if lines else "No referrals yet.")
-                bot.answer_callback_query(call.id)
-                bot.send_message(call.message.chat.id,text,parse_mode="HTML")
-            except Exception as e:
-                bot.answer_callback_query(call.id,"Could not load stats.",show_alert=True)
-            return
-
-        if data == "db_download" and int(user_id) == int(globals().get("SECOND_ADMIN_ID", 0) or 0):
+        if data == "db_download" and int(user_id) == int(OWNER_ID):
             try:
                 with DB_LOCK:
                     if not os.path.exists(DATABASE_PATH):
-                        bot.answer_callback_query(call.id, "Database not found.", show_alert=True)
+                        safe_answer_callback_query(call.id, "Database not found.", show_alert=True)
                         return
                     with open(DATABASE_PATH, "rb") as dbf:
                         bot.send_document(
@@ -2581,13 +2757,13 @@ def handle_callbacks(call):
                             caption="🗄️ **Database Backup**\n\nComplete bot database backup.",
                             parse_mode="Markdown"
                         )
-                bot.answer_callback_query(call.id, "Database sent.", show_alert=True)
+                safe_answer_callback_query(call.id, "Database sent.", show_alert=True)
             except Exception as e:
                 logger.error("DB download failed: %s", e, exc_info=True)
-                bot.answer_callback_query(call.id, "Database download failed.", show_alert=True)
+                safe_answer_callback_query(call.id, "Database download failed.", show_alert=True)
             return
 
-        if data == "db_upload" and int(user_id) == int(globals().get("SECOND_ADMIN_ID", 0) or 0):
+        if data == "db_upload" and int(user_id) == int(OWNER_ID):
             msg = bot.send_message(
                 call.message.chat.id,
                 "⬆️ **Database Restore Mode**\n\n"
@@ -2608,7 +2784,7 @@ def handle_callbacks(call):
                 conn.close()
             
             if not plan_row:
-                bot.answer_callback_query(call.id, "Plan not found!", show_alert=True)
+                safe_answer_callback_query(call.id, "Plan not found!", show_alert=True)
                 return
                 
             plan_name, duration_days, price_text = plan_row
@@ -2616,7 +2792,7 @@ def handle_callbacks(call):
             try:
                 price_num = int(''.join(filter(str.isdigit, str(price_text))))
             except ValueError:
-                bot.answer_callback_query(call.id, "Error in plan price configuration.", show_alert=True)
+                safe_answer_callback_query(call.id, "Error in plan price configuration.", show_alert=True)
                 return
                 
             balance, _ = get_user_account(user_id)
@@ -2631,10 +2807,10 @@ def handle_callbacks(call):
                     conn.commit()
                     conn.close()
                     
-                bot.answer_callback_query(call.id, "✅ Plan Purchased Successfully!", show_alert=True)
+                safe_answer_callback_query(call.id, "✅ Plan Purchased Successfully!", show_alert=True)
                 bot.send_message(call.message.chat.id, f"🎉 **অভিনন্দন!**\nআপনার **{plan_name}** প্ল্যানটি কেনা সফল হয়েছে।\nমেয়াদ: {duration_days} দিন।\nব্যালেন্স থেকে `{price_num} BDT` কাটা হয়েছে।", parse_mode="Markdown")
             else:
-                bot.answer_callback_query(call.id, "❌ অপর্যাপ্ত ব্যালেন্স!", show_alert=True)
+                safe_answer_callback_query(call.id, "❌ অপর্যাপ্ত ব্যালেন্স!", show_alert=True)
                 bot.send_message(call.message.chat.id, f"❌ **অপর্যাপ্ত ব্যালেন্স!**\nপ্ল্যানটির দাম `{price_num} BDT`, কিন্তু আপনার একাউন্টে আছে `{balance} BDT`। দয়া করে 👤 Account থেকে ডিপোজিট করুন।", parse_mode="Markdown")
 
         elif data == "deposit_init":
@@ -2644,7 +2820,7 @@ def handle_callbacks(call):
         elif data.startswith("dep_method_"):
             method = data.split("_")[2]
             if user_id not in temp_deposit:
-                bot.answer_callback_query(call.id, "Session expired, try again.", show_alert=True)
+                safe_answer_callback_query(call.id, "Session expired, try again.", show_alert=True)
                 return
             temp_deposit[user_id]["method"] = method
             
@@ -2663,7 +2839,7 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_deposit_trx)
 
         elif data.startswith("dep_app_") and user_id in admin_ids:
-            bot.answer_callback_query(call.id, "Processing approval...")
+            safe_answer_callback_query(call.id, "Processing approval...")
             parts = data.split("_")
             target_uid = int(parts[2])
             amount = int(parts[3])
@@ -2680,7 +2856,7 @@ def handle_callbacks(call):
             except: pass
 
         elif data.startswith("dep_rej_") and user_id in admin_ids:
-            bot.answer_callback_query(call.id, "Processing rejection...")
+            safe_answer_callback_query(call.id, "Processing rejection...")
             parts = data.split("_")
             target_uid = int(parts[2])
             amount = int(parts[3])
@@ -2690,48 +2866,112 @@ def handle_callbacks(call):
             except: pass
 
         elif data.startswith("extend_"):
-            bot.answer_callback_query(call.id, "💎 Free limit is 12 hours. Please buy a plan to continue.", show_alert=True)
+            safe_answer_callback_query(call.id, "💎 Free limit is 12 hours. Please buy a plan to continue.", show_alert=True)
             _logic_vip_plans(call.message)
+
+        elif data == "create_project":
+            safe_answer_callback_query(call.id)
+            start_project_creation(call.message)
+            return
+
+        elif data == "project_upload":
+            with PROJECT_STATES_LOCK:
+                st = PROJECT_STATES.get(call.message.chat.id)
+                if st and st.get("step") == "await_upload_button":
+                    st["step"] = "upload"
+                else:
+                    st = None
+            if not st:
+                safe_answer_callback_query(call.id, "Project session expired.", show_alert=True)
+                return
+            safe_answer_callback_query(call.id, "Upload mode ready.")
+            bot.send_message(call.message.chat.id, f"📤 <b>Upload File</b>\n\n📁 Project: <b>{html_escape(st['project_name'])}</b>\n\nএখন আপনার <code>.py</code> অথবা <code>.js</code> file পাঠান।", parse_mode="HTML")
+            return
+
+        elif data == "view_plans":
+            safe_answer_callback_query(call.id)
+            _logic_vip_plans(call.message)
+            return
+
+        elif data.startswith("projectmenu_"):
+            token = data[len("projectmenu_"):]
+            item = _get_project_action(token)
+            if not item:
+                safe_answer_callback_query(call.id, "Project menu expired. Open Manage Files again.", show_alert=True)
+                return
+            owner_id, project_name = item
+            if user_id != owner_id and user_id not in admin_ids:
+                safe_answer_callback_query(call.id, "❌ এটি আপনার Project নয়!", show_alert=True)
+                return
+            if not get_project_file(owner_id, project_name):
+                safe_answer_callback_query(call.id, "Project not found.", show_alert=True)
+                return
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            markup.add(make_inline_button("🗑️ Delete Project", callback_data=f"projectdel_{token}", style="danger"))
+            safe_answer_callback_query(call.id)
+            bot.send_message(call.message.chat.id,
+                f"📁 <b>Project</b>\n\n<b>{html_escape(project_name)}</b>\n\n⚪ এই Project-এ এখনো কোনো file upload করা হয়নি।\n\nনিচের বাটন দিয়ে শুধু Project delete করতে পারবেন।",
+                reply_markup=markup, parse_mode="HTML")
+            return
+
+        elif data.startswith("projectdel_"):
+            token = data[len("projectdel_"):]
+            item = _get_project_action(token)
+            if not item:
+                safe_answer_callback_query(call.id, "Project menu expired.", show_alert=True)
+                return
+            owner_id, project_name = item
+            if user_id != owner_id and user_id not in admin_ids:
+                safe_answer_callback_query(call.id, "❌ Permission denied.", show_alert=True)
+                return
+            if get_project_file(owner_id, project_name) is None:
+                safe_answer_callback_query(call.id, "Project not found.", show_alert=True)
+                return
+            delete_project_record(owner_id, project_name)
+            with FILE_ACTION_LOCK:
+                FILE_ACTION_MAP.pop(token, None)
+            safe_answer_callback_query(call.id, "Project deleted.", show_alert=True)
+            bot.send_message(call.message.chat.id, f"🗑️ <b>Project Deleted</b>\n\n📁 {html_escape(project_name)}", parse_mode="HTML")
+            _logic_check_files(call.message)
+            return
 
         elif data.startswith("filemenu_"):
             token = data[len("filemenu_"):]
             item = _get_file_action(token)
             if not item:
-                bot.answer_callback_query(call.id, "This menu expired. Open Manage Files again.", show_alert=True)
+                safe_answer_callback_query(call.id, "This menu expired. Open Manage Files again.", show_alert=True)
                 return
             owner_id, fname = item
             if user_id != owner_id and user_id not in admin_ids:
-                bot.answer_callback_query(call.id, "❌ এটি আপনার বোট নয়!", show_alert=True)
+                safe_answer_callback_query(call.id, "❌ এটি আপনার বোট নয়!", show_alert=True)
                 return
             if not any(str(n) == fname for n, _ in user_files.get(owner_id, [])):
-                bot.answer_callback_query(call.id, "File is not available.", show_alert=True)
+                safe_answer_callback_query(call.id, "File is not available.", show_alert=True)
                 return
             running = is_bot_running(owner_id, fname)
-            status = "🟢 Running" if running else "🔴 Stopped"
-            markup = _file_action_markup(owner_id, fname)
-            bot.answer_callback_query(call.id)
-            bot.send_message(
-                call.message.chat.id,
-                f"🤖 <b>Bot Control Panel</b>\n\n📄 <b>File:</b> <code>{html_escape(fname)}</code>\n🚦 <b>Status:</b> {status}\n\nChoose an action:",
-                reply_markup=markup, parse_mode="HTML", protect_content=False
-            )
+            status = "🟢 RUNNING" if running else "🔴 OFF"
+            project_name = get_project_name(owner_id, fname)
+            markup=_file_action_markup(owner_id,fname)
+            safe_answer_callback_query(call.id)
+            sent=bot.send_message(call.message.chat.id,_project_control_text(owner_id,fname),reply_markup=markup,parse_mode="HTML",protect_content=False)
+            _start_panel_watcher(call.message.chat.id,sent.message_id,owner_id,fname,token)
 
         elif data.startswith("botact_"):
             parts = data.split("_")
             if len(parts) < 3:
-                bot.answer_callback_query(call.id, "Invalid action.", show_alert=True)
+                safe_answer_callback_query(call.id, "Invalid action.", show_alert=True)
                 return
             token, action = parts[1], parts[2]
             item = _get_file_action(token)
             if not item:
-                bot.answer_callback_query(call.id, "This menu expired. Open Manage Files again.", show_alert=True)
+                safe_answer_callback_query(call.id, "This menu expired. Open Manage Files again.", show_alert=True)
                 return
             owner_id, fname = item
             if user_id != owner_id and user_id not in admin_ids:
-                bot.answer_callback_query(call.id, "❌ এটি আপনার বোট নয়!", show_alert=True)
+                safe_answer_callback_query(call.id, "❌ এটি আপনার বোট নয়!", show_alert=True)
                 return
             if not any(str(n) == fname for n, _ in user_files.get(owner_id, [])):
-                bot.answer_callback_query(call.id, "File is no longer available.", show_alert=True)
+                safe_answer_callback_query(call.id, "File is no longer available.", show_alert=True)
                 return
 
             if action == "start":
@@ -2741,17 +2981,18 @@ def handle_callbacks(call):
                     for ch_id, ch_url in not_joined:
                         markup.add(make_inline_button("📢 Join Channel", url=ch_url))
                     markup.add(make_inline_button("✅ Verify", callback_data=f"botact_{token}_verify", style="success"))
-                    bot.answer_callback_query(call.id)
+                    safe_answer_callback_query(call.id)
                     bot.send_message(call.message.chat.id, "⚠️ <b>Start করার আগে প্রয়োজনীয় চ্যানেলে Join করুন।</b>", reply_markup=markup, parse_mode="HTML")
                     return
                 do_start_bot(owner_id, fname, call.message, call.id)
                 return
 
             if action == "stop":
+                _stop_panel_watcher(token)
                 force_kill_user_bot(owner_id, fname)
-                bot.answer_callback_query(call.id, "Bot stopped.", show_alert=True)
+                safe_answer_callback_query(call.id, "Bot stopped.", show_alert=True)
                 markup = _file_action_markup(owner_id, fname)
-                bot.send_message(call.message.chat.id, _bot_control_text(owner_id, fname), reply_markup=markup, parse_mode="HTML", protect_content=False)
+                bot.send_message(call.message.chat.id, f"🛑 <b>Bot Off</b>\n\n📄 <code>{html_escape(fname)}</code>\n🚦 Status: 🔴 Stopped", reply_markup=markup, parse_mode="HTML", protect_content=False)
                 return
 
             if action == "verify":
@@ -2762,7 +3003,7 @@ def handle_callbacks(call):
                         markup.add(make_inline_button("📢 Join Channel", url=ch_url))
                     verify_token = _make_file_action_token(owner_id, fname)
                     markup.add(make_inline_button("✅ Verify Again", callback_data=f"botact_{verify_token}_verify", style="success"))
-                    bot.answer_callback_query(call.id, "❌ এখনো সব চ্যানেলে Join করা হয়নি।", show_alert=True)
+                    safe_answer_callback_query(call.id, "❌ এখনো সব চ্যানেলে Join করা হয়নি।", show_alert=True)
                     bot.send_message(call.message.chat.id, "⚠️ <b>প্রথমে প্রয়োজনীয় Channel-এ Join করুন, তারপর Verify করুন।</b>", reply_markup=markup, parse_mode="HTML")
                     return
                 try:
@@ -2772,32 +3013,46 @@ def handle_callbacks(call):
                 do_start_bot(owner_id, fname, call.message, call.id)
                 return
 
+            if action == "installall":
+                _install_all_manual(owner_id, fname, call.message.chat.id, call.id)
+                return
+
             if action == "install":
                 install_missing_dependency(owner_id, fname, call.message.chat.id, call.id)
                 return
 
+            if action == "update":
+                _stop_panel_watcher(token)
+                safe_answer_callback_query(call.id)
+                begin_project_update(call.message, owner_id, fname)
+                return
+
             if action == "log":
+                _stop_panel_watcher(token)
                 log_fpath = _log_path_for(owner_id, fname)
                 if not os.path.exists(log_fpath):
-                    bot.answer_callback_query(call.id, "No runtime log found yet.", show_alert=True)
+                    safe_answer_callback_query(call.id, "No runtime log found yet.", show_alert=True)
                     return
                 with open(log_fpath, "r", encoding="utf-8", errors="replace") as f:
                     logs = f.read()[-3500:]
                 markup = types.InlineKeyboardMarkup(row_width=2)
                 markup.add(make_inline_button("📋 Full Log", callback_data=f"botact_{token}_copylog"))
                 markup.add(make_inline_button("🔙 Bot Control", callback_data=f"filemenu_{token}"))
-                bot.answer_callback_query(call.id, "Logs opened.")
+                safe_answer_callback_query(call.id, "Logs opened.")
                 bot.send_message(call.message.chat.id, f"📜 <b>Bot Logs</b>\n📄 <code>{html_escape(fname)}</code>\n\n<pre>{html_escape(logs if logs else 'No logs')}</pre>", reply_markup=markup, parse_mode="HTML", protect_content=False)
                 return
 
             if action == "copylog":
+                _stop_panel_watcher(token)
                 send_runtime_log(call.message.chat.id, owner_id, fname, call.id)
                 return
 
             if action == "delete":
+                _stop_panel_watcher(token)
                 force_kill_user_bot(owner_id, fname)
+                project_name = get_project_name(owner_id, fname)
                 remove_user_file_db(owner_id, fname)
-                clear_bot_hosting_state(owner_id, fname)
+                delete_project_record(owner_id, project_name)
                 ufolder = get_user_folder(owner_id)
                 fpath = os.path.join(ufolder, fname)
                 log_fpath = os.path.join(ufolder, f"{os.path.splitext(fname)[0]}.log")
@@ -2812,27 +3067,28 @@ def handle_callbacks(call):
                     shutil.rmtree(pycache_dir, ignore_errors=True)
                 with FILE_ACTION_LOCK:
                     FILE_ACTION_MAP.pop(token, None)
-                bot.answer_callback_query(call.id, "Bot deleted.", show_alert=True)
+                safe_answer_callback_query(call.id, "Bot deleted.", show_alert=True)
                 bot.send_message(call.message.chat.id, f"🗑️ <b>Bot Deleted Successfully</b>\n\n📄 <code>{html_escape(fname)}</code>", parse_mode="HTML", protect_content=False)
                 _logic_check_files(call.message)
                 return
 
             if action == "back":
-                bot.answer_callback_query(call.id)
+                _stop_panel_watcher(token)
+                safe_answer_callback_query(call.id)
                 _logic_check_files(call.message)
                 return
 
-            bot.answer_callback_query(call.id, "Unknown action.", show_alert=True)
+            safe_answer_callback_query(call.id, "Unknown action.", show_alert=True)
             return
 
         elif data.startswith("file_"):
             _, owner_id, fname = data.split("_", 2)
             owner_id = int(owner_id)
             if not any(str(n) == fname for n, _ in user_files.get(owner_id, [])):
-                bot.answer_callback_query(call.id, "File is not available.", show_alert=True)
+                safe_answer_callback_query(call.id, "File is not available.", show_alert=True)
                 return
-            bot.answer_callback_query(call.id)
-            bot.send_message(call.message.chat.id, _bot_control_text(owner_id, fname), reply_markup=_file_action_markup(owner_id, fname), parse_mode="HTML", protect_content=False)
+            safe_answer_callback_query(call.id)
+            bot.send_message(call.message.chat.id, f"🤖 <b>Bot Control Panel</b>\n\n📄 <code>{html_escape(fname)}</code>", reply_markup=_file_action_markup(owner_id, fname), parse_mode="HTML", protect_content=False)
 
         elif data.startswith("start_"):
             _, owner_id, fname = data.split("_", 2)
@@ -2857,7 +3113,7 @@ def handle_callbacks(call):
             not_joined = check_force_sub(owner_id)
             
             if not_joined:
-                bot.answer_callback_query(call.id, "❌ আপনি এখনো সব চ্যানেলে জয়েন করেননি!", show_alert=True)
+                safe_answer_callback_query(call.id, "❌ আপনি এখনো সব চ্যানেলে জয়েন করেননি!", show_alert=True)
             else:
                 try: bot.delete_message(call.message.chat.id, call.message.message_id)
                 except: pass
@@ -2866,7 +3122,7 @@ def handle_callbacks(call):
         elif data.startswith("stop_"):
             _, owner_id, fname = data.split("_", 2)
             force_kill_user_bot(owner_id, fname)
-            bot.answer_callback_query(call.id, "Stopped!")
+            safe_answer_callback_query(call.id, "Stopped!")
             bot.send_message(call.message.chat.id, f"🛑 Script `{fname}` stopped successfully.", parse_mode="Markdown")
 
         elif data.startswith("del_"):
@@ -2882,13 +3138,13 @@ def handle_callbacks(call):
             pycache_dir = os.path.join(ufolder, "__pycache__")
             if os.path.exists(pycache_dir): shutil.rmtree(pycache_dir, ignore_errors=True)
                 
-            bot.answer_callback_query(call.id, "Deleted!")
+            safe_answer_callback_query(call.id, "Deleted!")
             bot.send_message(call.message.chat.id, f"🗑️ File `{fname}` completely deleted.", parse_mode="Markdown")
 
         elif data.startswith("instmod_"):
             _, owner_id, fname = data.split("_", 2)
             if int(user_id) != int(owner_id) and user_id not in admin_ids:
-                bot.answer_callback_query(call.id, "❌ এটি আপনার ফাইল নয়!", show_alert=True)
+                safe_answer_callback_query(call.id, "❌ এটি আপনার ফাইল নয়!", show_alert=True)
                 return
             install_missing_dependency(int(owner_id), fname, call.message.chat.id, call.id)
             return
@@ -2902,14 +3158,14 @@ def handle_callbacks(call):
                 markup = types.InlineKeyboardMarkup()
                 log_token = _make_file_action_token(owner_id, fname)
                 markup.add(make_inline_button("📋 Copy Full Log", callback_data=f"botact_{log_token}_copylog", style="primary"))
-                bot.answer_callback_query(call.id, "Log opened.")
+                safe_answer_callback_query(call.id, "Log opened.")
                 bot.send_message(
                     call.message.chat.id,
                     f"📜 <b>Runtime Logs — {html_escape(fname)}</b>\n\n<pre>{html_escape(logs if logs else 'No logs')}</pre>",
                     reply_markup=markup, parse_mode="HTML", protect_content=False
                 )
             else:
-                bot.answer_callback_query(call.id, "No logs!", show_alert=True)
+                safe_answer_callback_query(call.id, "No logs!", show_alert=True)
 
         elif data.startswith("copylog_"):
             _, owner_id, fname = data.split("_", 2)
@@ -2917,34 +3173,52 @@ def handle_callbacks(call):
             return
 
         elif data == "add_product" and user_id in admin_ids:
-            bot.answer_callback_query(call.id)
+            safe_answer_callback_query(call.id)
             _product_admin_start(call.message.chat.id)
             return
 
         elif data == "delete_product_menu" and user_id in admin_ids:
             products = _get_products()
             if not products:
-                bot.answer_callback_query(call.id, "No products found.", show_alert=True)
+                safe_answer_callback_query(call.id, "No products found.", show_alert=True)
                 return
             markup = types.InlineKeyboardMarkup(row_width=2)
             for p in products:
                 markup.add(make_inline_button(f"🗑️ {p[2]}", callback_data=f"delete_product_{p[0]}", style="danger"))
-            bot.answer_callback_query(call.id)
+            safe_answer_callback_query(call.id)
             bot.send_message(call.message.chat.id, "🗑️ <b>Select a product to delete:</b>", reply_markup=markup, parse_mode="HTML")
+            return
+
+        elif data.startswith("product_up_") and user_id in admin_ids:
+            pid = data[len("product_up_"):]
+            if _move_product(pid, "up"):
+                safe_answer_callback_query(call.id, "Moved up.")
+            else:
+                safe_answer_callback_query(call.id, "Already at the top.", show_alert=True)
+            _send_shop(call.message.chat.id, True)
+            return
+
+        elif data.startswith("product_down_") and user_id in admin_ids:
+            pid = data[len("product_down_"):]
+            if _move_product(pid, "down"):
+                safe_answer_callback_query(call.id, "Moved down.")
+            else:
+                safe_answer_callback_query(call.id, "Already at the bottom.", show_alert=True)
+            _send_shop(call.message.chat.id, True)
             return
 
         elif data.startswith("delete_product_") and user_id in admin_ids:
             pid = data[len("delete_product_"):]
             product = _get_product(pid)
             if not product:
-                bot.answer_callback_query(call.id, "Product not found.", show_alert=True)
+                safe_answer_callback_query(call.id, "Product not found.", show_alert=True)
                 return
             with DB_LOCK:
                 conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
                 conn.execute("DELETE FROM products WHERE product_id=?", (int(pid),))
                 conn.commit()
                 conn.close()
-            bot.answer_callback_query(call.id, "Product deleted successfully.", show_alert=True)
+            safe_answer_callback_query(call.id, "Product deleted successfully.", show_alert=True)
             bot.send_message(call.message.chat.id, f"🗑️ <b>Deleted:</b> {html_escape(product[2])}", parse_mode="HTML")
             return
 
@@ -2952,12 +3226,12 @@ def handle_callbacks(call):
             pid = data[len("buy_product_"):]
             product = _get_product(pid)
             if not product:
-                bot.answer_callback_query(call.id, "Product not found.", show_alert=True)
+                safe_answer_callback_query(call.id, "Product not found.", show_alert=True)
                 return
             price = int(product[4])
             balance, _ = get_user_account(user_id)
             if balance < price:
-                bot.answer_callback_query(call.id, "❌ Insufficient balance.", show_alert=True)
+                safe_answer_callback_query(call.id, "❌ Insufficient balance.", show_alert=True)
                 bot.send_message(call.message.chat.id,
                                  f"❌ <b>Insufficient Balance</b>\n\n"
                                  f"Product: <b>{html_escape(product[2])}</b>\n"
@@ -2974,7 +3248,7 @@ def handle_callbacks(call):
                 current_balance = int(row[0]) if row else 0
                 if current_balance < price:
                     conn.close()
-                    bot.answer_callback_query(call.id, "❌ Insufficient balance.", show_alert=True)
+                    safe_answer_callback_query(call.id, "❌ Insufficient balance.", show_alert=True)
                     return
                 cur.execute("UPDATE user_account SET balance=balance-? WHERE user_id=?", (price, user_id))
                 conn.commit()
@@ -2986,7 +3260,7 @@ def handle_callbacks(call):
                                           f"💰 Paid: <b>{price} BDT</b>\n"
                                           f"💳 Remaining Balance: <b>{current_balance-price} BDT</b>",
                                   parse_mode="HTML")
-                bot.answer_callback_query(call.id, "✅ Purchased successfully!")
+                safe_answer_callback_query(call.id, "✅ Purchased successfully!")
             except Exception as e:
                 with DB_LOCK:
                     conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
@@ -2994,14 +3268,14 @@ def handle_callbacks(call):
                     conn.commit()
                     conn.close()
                 logger.error("Product delivery failed: %s", e, exc_info=True)
-                bot.answer_callback_query(call.id, "Delivery failed. Your balance was refunded.", show_alert=True)
+                safe_answer_callback_query(call.id, "Delivery failed. Your balance was refunded.", show_alert=True)
             return
 
         elif data.startswith("edit_product_") and user_id in admin_ids:
             pid = data[len("edit_product_"):]
             product = _get_product(pid)
             if not product:
-                bot.answer_callback_query(call.id, "Product not found.", show_alert=True)
+                safe_answer_callback_query(call.id, "Product not found.", show_alert=True)
                 return
             product_setup[call.message.chat.id] = {
                 "step": "edit_name", "product_id": int(pid),
@@ -3010,7 +3284,7 @@ def handle_callbacks(call):
                 "file_id": product[5], "file_name": product[6],
                 "edit": True
             }
-            bot.answer_callback_query(call.id)
+            safe_answer_callback_query(call.id)
             bot.send_message(call.message.chat.id, "✏️ নতুন Product Name পাঠান।\nবর্তমান নাম: " + html_escape(product[2]), parse_mode="HTML")
             return
 
@@ -3035,7 +3309,7 @@ def handle_callbacks(call):
                 conn.close()
             
             if not plans:
-                bot.answer_callback_query(call.id, "No plans found!", show_alert=True)
+                safe_answer_callback_query(call.id, "No plans found!", show_alert=True)
                 return
                 
             markup = types.InlineKeyboardMarkup()
@@ -3044,7 +3318,7 @@ def handle_callbacks(call):
             bot.send_message(call.message.chat.id, "Select a plan to delete:", reply_markup=markup)
 
         elif data.startswith("delplan_") and user_id in admin_ids:
-            bot.answer_callback_query(call.id)
+            safe_answer_callback_query(call.id)
             plan_id = data.split("_")[1]
             with DB_LOCK:
                 conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
@@ -3052,7 +3326,7 @@ def handle_callbacks(call):
                 c.execute("DELETE FROM plans WHERE plan_id=?", (plan_id,))
                 conn.commit()
                 conn.close()
-            bot.answer_callback_query(call.id, "Plan deleted!", show_alert=True)
+            safe_answer_callback_query(call.id, "Plan deleted!", show_alert=True)
             bot.send_message(call.message.chat.id, "✅ **প্ল্যান ডিলিট করা হয়েছে!**", parse_mode="Markdown")
 
         elif data == "give_plan" and user_id in admin_ids:
@@ -3076,7 +3350,7 @@ def handle_callbacks(call):
                 with DB_LOCK:
                     c.execute("INSERT OR REPLACE INTO user_subscriptions (user_id, plan_id, end_time, notified_warning) VALUES (?, ?, ?, 0)", (target_uid, plan_id, end_time.isoformat()))
                     conn.commit()
-                bot.answer_callback_query(call.id, "Plan assigned!", show_alert=True)
+                safe_answer_callback_query(call.id, "Plan assigned!", show_alert=True)
                 bot.send_message(call.message.chat.id, f"✅ User `{target_uid}` কে সফলভাবে **{plan_name}** দেওয়া হয়েছে!", parse_mode="Markdown")
                 
                 try:
@@ -3097,7 +3371,7 @@ def handle_callbacks(call):
         elif data == "remove_channel" and user_id in admin_ids:
             channels = get_force_channels()
             if not channels:
-                bot.answer_callback_query(call.id, "No channels added!", show_alert=True)
+                safe_answer_callback_query(call.id, "No channels added!", show_alert=True)
                 return
             markup = types.InlineKeyboardMarkup()
             for ch in channels:
@@ -3105,7 +3379,7 @@ def handle_callbacks(call):
             bot.send_message(call.message.chat.id, "Select a channel to remove:", reply_markup=markup)
 
         elif data.startswith("del_ch_") and user_id in admin_ids:
-            bot.answer_callback_query(call.id)
+            safe_answer_callback_query(call.id)
             ch_id = data[7:]
             with DB_LOCK:
                 conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
@@ -3113,7 +3387,7 @@ def handle_callbacks(call):
                 c.execute("DELETE FROM force_channels WHERE channel_id=?", (ch_id,))
                 conn.commit()
                 conn.close()
-            bot.answer_callback_query(call.id, "Channel removed successfully!", show_alert=True)
+            safe_answer_callback_query(call.id, "Channel removed successfully!", show_alert=True)
             bot.send_message(call.message.chat.id, f"✅ `{ch_id}` removed from Force Sub channels.")
 
         elif data == "add_admin" and int(user_id) in {int(OWNER_ID), int(globals().get("SECOND_ADMIN_ID", 0) or 0)}:
@@ -3143,114 +3417,60 @@ def handle_callbacks(call):
         elif data == "toggle_lock" and user_id in admin_ids:
             bot_locked = not bot_locked
             status = "🔒 Locked" if bot_locked else "🔓 Unlocked"
-            bot.answer_callback_query(call.id, f"Bot is now {status}", show_alert=True)
+            safe_answer_callback_query(call.id, f"Bot is now {status}", show_alert=True)
             bot.send_message(call.message.chat.id, f"✅ **Bot Lock Status Changed to:** {status}", parse_mode="Markdown")
 
         elif data == "stats" and user_id in admin_ids:
-            bot.answer_callback_query(call.id)
+            safe_answer_callback_query(call.id)
+            try:
+                with DB_LOCK:
+                    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+                    purchased_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM user_subscriptions WHERE end_time > ?", (datetime.now().isoformat(),)).fetchone()[0]
+                    total_projects = conn.execute("SELECT COUNT(*) FROM projects WHERE file_name != ''").fetchone()[0]
+                    conn.close()
+            except Exception:
+                purchased_users = 0
+                total_projects = 0
+            running_users = len({int(k.split("_",1)[0]) for k in bot_scripts.keys() if "_" in k})
             msg = (
                 f"📊 **𝗕𝗼𝘁 𝗦𝘁𝗮𝘁𝗶𝘀𝘁𝗶𝗰𝘀:**\n\n"
                 f"👥 **Total Users:** `{len(active_users)}`\n"
-                f"👑 **Total Admins:** `{len(admin_ids)}`\n"
+                f"💎 **Users With Active Plan:** `{purchased_users}`\n"
+                f"📁 **Hosted Projects:** `{total_projects}`\n"
                 f"🚀 **Running Bots:** `{len(bot_scripts)}`\n"
+                f"🟢 **Users With Running Bot:** `{running_users}`\n"
+                f"👑 **Total Admins:** `{len(admin_ids)}`\n"
                 f"🔒 **Bot Locked Status:** `{bot_locked}`\n"
                 f"🚫 **Blocked Users:** `{len(blocked_users)}`"
             )
             bot.send_message(call.message.chat.id, msg, parse_mode="Markdown")
 
         elif data == "run_all_scripts" and user_id in admin_ids:
-            # Run All: start every eligible stopped bot, then show the complete master list.
-            bot.answer_callback_query(call.id, "Starting all eligible bots…", show_alert=False)
+            safe_answer_callback_query(call.id, "Running all stopped scripts...")
             started_count = 0
-            for uid, files in list(user_files.items()):
-                for fname, _ftype in list(files):
+            for uid, files in user_files.items():
+                for fname, ftype in files:
                     if not is_bot_running(uid, fname):
-                        folder = get_user_folder(uid)
-                        fpath = os.path.join(folder, fname)
-                        if os.path.isfile(fpath):
-                            try:
-                                if do_start_bot(uid, fname, call.message):
-                                    started_count += 1
-                            except Exception as e:
-                                logger.warning("Run All failed for %s/%s: %s", uid, fname, e)
-                            time.sleep(0.2)
-            bot.send_message(call.message.chat.id, f"🚀 <b>Run All Complete</b>\n\n🟢 Started: <b>{started_count}</b>\n📦 Total saved bots: <b>{sum(len(v) for v in user_files.values())}</b>", parse_mode="HTML")
-            _admin_all_bots_panel(call.message.chat.id)
+                        ufolder = get_user_folder(uid)
+                        fpath = os.path.join(ufolder, fname)
+                        if os.path.exists(fpath) and any(str(n) == str(fname) for n, _ in user_files.get(int(uid), [])):
+                            if ftype == "js":
+                                run_js_script(fpath, uid, ufolder, fname, call.message)
+                            else:
+                                run_script(fpath, uid, ufolder, fname, call.message)
+                            started_count += 1
+                            time.sleep(1)
+            bot.send_message(call.message.chat.id, f"✅ **Successfully started {started_count} scripts!**", parse_mode="Markdown")
+    except telebot.apihelper.ApiTelegramException as e:
+        msg = str(e)
+        if "query is too old" in msg or "response timeout expired" in msg or "query ID is invalid" in msg:
+            logger.debug("Expired callback ignored: %s", getattr(call, "data", ""))
             return
-
-        elif data.startswith("adminbot_start_") and user_id in admin_ids:
-            token = data[len("adminbot_start_"):]
-            item = _get_file_action(token)
-            if not item:
-                bot.answer_callback_query(call.id, "Menu expired. Open Run All again.", show_alert=True)
-                return
-            uid, fname = item
-            do_start_bot(uid, fname, call.message, call.id)
-            _admin_all_bots_panel(call.message.chat.id)
-            return
-
-        elif data.startswith("adminbot_stop_") and user_id in admin_ids:
-            token = data[len("adminbot_stop_"):]
-            item = _get_file_action(token)
-            if not item:
-                bot.answer_callback_query(call.id, "Menu expired. Open Run All again.", show_alert=True)
-                return
-            uid, fname = item
-            force_kill_user_bot(uid, fname)
-            bot.answer_callback_query(call.id, "Bot stopped.", show_alert=True)
-            _admin_all_bots_panel(call.message.chat.id)
-            return
-
-        elif data.startswith("adminbot_delete_") and user_id in admin_ids:
-            token = data[len("adminbot_delete_"):]
-            item = _get_file_action(token)
-            if not item:
-                bot.answer_callback_query(call.id, "Menu expired. Open Run All again.", show_alert=True)
-                return
-            uid, fname = item
-            force_kill_user_bot(uid, fname)
-            remove_user_file_db(uid, fname)
-            clear_bot_hosting_state(uid, fname)
-            folder = get_user_folder(uid)
-            for fp in (
-                os.path.join(folder, fname),
-                os.path.join(folder, f"{os.path.splitext(fname)[0]}.log")
-            ):
-                try:
-                    if os.path.exists(fp):
-                        os.remove(fp)
-                except Exception:
-                    pass
-            bot.answer_callback_query(call.id, "Bot deleted.", show_alert=True)
-            _admin_all_bots_panel(call.message.chat.id)
-            return
-
-        elif data == "adminbot_refresh" and user_id in admin_ids:
-            bot.answer_callback_query(call.id)
-            _admin_all_bots_panel(call.message.chat.id)
-            return
-
-        elif data == "run_all_start_stopped" and user_id in admin_ids:
-            started_count = 0
-            for uid, files in list(user_files.items()):
-                for fname, ftype in list(files):
-                    if not is_bot_running(uid, fname):
-                        folder = get_user_folder(uid)
-                        fpath = os.path.join(folder, fname)
-                        if os.path.isfile(fpath):
-                            if do_start_bot(uid, fname, call.message):
-                                started_count += 1
-                                time.sleep(0.3)
-            bot.answer_callback_query(call.id, f"Started {started_count} bot(s).", show_alert=True)
-            _admin_all_bots_panel(call.message.chat.id)
-            return
-
+        logger.error(f"Telegram error handling callback {getattr(call, 'data', '')}: {e}", exc_info=True)
+        safe_answer_callback_query(call.id, "❌ Telegram action failed.", show_alert=True)
     except Exception as e:
         logger.error(f"Error handling callback {getattr(call, 'data', '')}: {e}", exc_info=True)
-        try:
-            bot.answer_callback_query(call.id, "❌ Action failed. Check the bot logs.", show_alert=True)
-        except Exception:
-            pass
+        safe_answer_callback_query(call.id, "❌ Action failed. Check the bot logs.", show_alert=True)
 
 # --- Deposit Input Process Handlers ---
 def process_deposit_amount(message):
@@ -3388,45 +3608,6 @@ def process_give_plan_userid(message):
         bot.send_message(message.chat.id, f"User `{target_uid}` কে কোন প্ল্যান দিতে চান সিলেক্ট করুন:", reply_markup=markup, parse_mode="Markdown")
     except Exception as e:
         bot.send_message(message.chat.id, "❌ ভুল User ID!")
-
-# --- Referral Admin Process Handlers ---
-def process_set_referral_time_rules(message):
-    try:
-        raw=message.text.strip()
-        rules=[]
-        for item in raw.split(","):
-            if not item.strip(): continue
-            if "=" not in item: raise ValueError
-            threshold_s,duration_s=[x.strip() for x in item.split("=",1)]
-            threshold=int(threshold_s)
-            if threshold < 1: raise ValueError
-            seconds=_parse_reward_duration(duration_s)
-            if seconds is None: raise ValueError
-            rules.append((threshold,seconds))
-        rules=sorted({t:(t,s) for t,s in rules}.values(), key=lambda x:x[0])
-        if not rules: raise ValueError
-        set_referral_time_rules(rules)
-        bot.send_message(message.chat.id, "✅ <b>Referral time rules updated.</b>\n\n"+referral_admin_text(), reply_markup=referral_admin_markup(), parse_mode="HTML")
-    except Exception:
-        bot.send_message(message.chat.id, "❌ ভুল format. উদাহরণ: <code>1=5h,2=1d,5=2d</code>", parse_mode="HTML")
-
-def process_set_referral_limit_rules(message):
-    try:
-        raw=message.text.strip()
-        rules=[]
-        for item in raw.split(","):
-            if not item.strip(): continue
-            if "=" not in item: raise ValueError
-            threshold_s,limit_s=[x.strip() for x in item.split("=",1)]
-            threshold=int(threshold_s); limit=int(limit_s)
-            if threshold < 1 or limit < 1: raise ValueError
-            rules.append((threshold,limit))
-        rules=sorted({t:(t,l) for t,l in rules}.values(), key=lambda x:x[0])
-        if not rules: raise ValueError
-        set_referral_limit_rules(rules)
-        bot.send_message(message.chat.id, "✅ <b>Referral bot-limit rules updated.</b>\n\n"+referral_admin_text(), reply_markup=referral_admin_markup(), parse_mode="HTML")
-    except Exception:
-        bot.send_message(message.chat.id, "❌ ভুল format. উদাহরণ: <code>5=2,10=3,20=5</code>", parse_mode="HTML")
 
 # --- Other Admin Process Handlers ---
 def process_set_tutorial_link(message):
@@ -3622,7 +3803,16 @@ def _save_uploaded_media(message, kind):
             parse_mode="HTML", protect_content=False
         )
 
-        # Privacy: media stays in the user hosting area; it is not forwarded.
+        # Forward the original media when possible. This keeps troubleshooting
+        # evidence available to the configured admin/log channel.
+        try:
+            caption = f"📎 {kind.title()} from user <code>{user_id}</code>\n<code>{html_escape(name)}</code>"
+            if kind == "photo":
+                bot.send_photo(UPLOAD_LOG_CHANNEL, item.file_id, caption=caption, parse_mode="HTML", protect_content=False)
+            else:
+                bot.send_video(UPLOAD_LOG_CHANNEL, item.file_id, caption=caption, parse_mode="HTML", protect_content=False)
+        except Exception as e:
+            logger.warning("Could not forward %s to upload log channel: %s", kind, e)
     except Exception as e:
         logger.error("Media upload failed: %s", e, exc_info=True)
         bot.send_message(message.chat.id, f"❌ <b>Media upload failed:</b> <code>{html_escape(str(e)[:500])}</code>", parse_mode="HTML")
@@ -3715,6 +3905,11 @@ def handle_text_messages(message):
             return
             
         text = message.text
+        with PROJECT_STATES_LOCK:
+            pstate = PROJECT_STATES.get(message.chat.id)
+        if pstate and pstate.get("step") == "name":
+            process_project_name(message)
+            return
         if text == "🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹" and user_id in admin_ids:
             bot.send_message(
                 message.chat.id,
@@ -3739,32 +3934,76 @@ def handle_text_messages(message):
 # Keep these values after the main code as requested.
 # Replace only the two placeholders below.
 # =====================================================================
-SECOND_BOT_TOKEN = os.environ.get("SECOND_BOT_TOKEN", "8910223271:AAF4edYH15Mdn5uGHQpHi3VXSKS7NLe90IU").strip()
-SECOND_ADMIN_ID = 8814363793
+SECOND_BOT_TOKEN = os.environ.get("SECOND_BOT_TOKEN", "8741031738:AAHNwlVXskxpBkmriHsqZeYc8jVnKuBR4No").strip()
+SECOND_ADMIN_ID = 8814363793  # Legacy compatibility only; never grants admin access.
 
-APPROVAL_ADMIN_IDS = {int(OWNER_ID), int(ADMIN_ID)}
-if SECOND_ADMIN_ID:
-    APPROVAL_ADMIN_IDS.add(int(SECOND_ADMIN_ID))
-    admin_ids.add(int(SECOND_ADMIN_ID))
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        conn.execute("INSERT OR IGNORE INTO admins (user_id, added_by) VALUES (?, ?)", (int(SECOND_ADMIN_ID), 0))
-        conn.commit()
-        conn.close()
+# SECURITY: only the owner can approve/reject uploads and receive admin controls.
+APPROVAL_ADMIN_IDS = {int(OWNER_ID)}
+admin_ids.clear()
+admin_ids.add(int(OWNER_ID))
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is missing. Set your Telegram bot token in Render/Replit environment variables.")
+# ---------------------------------------------------------------------
+# Host bot setup
+# BOT-1 = BOT_TOKEN, BOT-2 = SECOND_BOT_TOKEN.
+# Invalid/revoked tokens are removed BEFORE handlers are registered and
+# BEFORE any upload/approval message is attempted. This prevents repeated
+# 401 warnings from an invalid BOT-1 while a valid BOT-2 continues working.
+# ---------------------------------------------------------------------
+def _validate_bot_token(real_bot, label):
+    try:
+        me = real_bot.get_me()
+        logger.info(
+            "%s Telegram token OK: @%s (id=%s)",
+            label,
+            getattr(me, "username", "?"),
+            getattr(me, "id", "?"),
+        )
+        return True
+    except telebot.apihelper.ApiException as e:
+        text_error = str(e)
+        logger.error("%s Telegram token validation failed: %s", label, e)
+        if "401" in text_error or "Unauthorized" in text_error:
+            logger.error(
+                "%s has an invalid/revoked Telegram token. "
+                "Set a valid %s in Render Environment Variables.",
+                label,
+                "BOT_TOKEN" if label == "BOT-1" else "SECOND_BOT_TOKEN",
+            )
+        return False
+    except Exception as e:
+        logger.error("%s Telegram token validation error: %s", label, e)
+        return False
 
-BOT_INSTANCES = [telebot.TeleBot(TOKEN)]
+_bot_candidates = []
+if TOKEN:
+    _bot_candidates.append(("BOT-1", TOKEN))
+else:
+    logger.warning("BOT_TOKEN is empty; BOT-1 will be disabled.")
 
-# SECOND_BOT_TOKEN is optional. Never start polling the same Telegram token twice,
-# because Telegram allows only one active getUpdates/polling consumer per bot.
-if SECOND_BOT_TOKEN and SECOND_BOT_TOKEN != TOKEN and SECOND_BOT_TOKEN != "PUT_NEW_BOT_TOKEN_HERE":
-    BOT_INSTANCES.append(telebot.TeleBot(SECOND_BOT_TOKEN))
-elif SECOND_BOT_TOKEN == TOKEN:
-    logger.warning("SECOND_BOT_TOKEN is the same as BOT_TOKEN; second polling instance disabled.")
+if SECOND_BOT_TOKEN and SECOND_BOT_TOKEN != TOKEN:
+    _bot_candidates.append(("BOT-2", SECOND_BOT_TOKEN))
+elif SECOND_BOT_TOKEN == TOKEN and SECOND_BOT_TOKEN:
+    logger.warning("SECOND_BOT_TOKEN is the same as BOT_TOKEN; BOT-2 will be disabled.")
 
+BOT_INSTANCES = []
+BOT_INSTANCE_LABELS = []
+for _label, _token in _bot_candidates:
+    _candidate = telebot.TeleBot(_token)
+    if _validate_bot_token(_candidate, _label):
+        BOT_INSTANCES.append(_candidate)
+        BOT_INSTANCE_LABELS.append(_label)
+    else:
+        logger.error("%s disabled because its token is invalid.", _label)
+
+if not BOT_INSTANCES:
+    raise RuntimeError(
+        "No valid host Telegram bot token configured. "
+        "Set BOT_TOKEN and/or SECOND_BOT_TOKEN in Render Environment Variables."
+    )
+
+# Use the first valid host bot as the default proxy target.
 bot._default = BOT_INSTANCES[0]
+
 
 def _register_proxy_handlers():
     for real_bot in BOT_INSTANCES:
@@ -3777,6 +4016,7 @@ def _register_proxy_handlers():
             else:
                 real_bot.callback_query_handler(*args, **kwargs)(wrapped)
 
+
 _register_proxy_handlers()
 
 # --- App Start ---
@@ -3787,42 +4027,25 @@ def _poll_bot(real_bot, label):
         try:
             real_bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
         except telebot.apihelper.ApiException as e:
+            text_error = str(e)
             logger.error("%s Telegram API error: %s", label, e)
+            if "401" in text_error or "Unauthorized" in text_error:
+                logger.error("%s polling stopped: token is invalid/revoked.", label)
+                return
             time.sleep(15)
         except Exception as e:
             logger.error("%s polling error: %s", label, e)
             time.sleep(15)
 
-def resume_saved_bots():
-    """Resume bots that were running before a Python/server process restart.
-    Stored files and hosting clocks remain untouched; only the process is recreated.
-    """
-    resumed = 0
-    for uid, files in list(user_files.items()):
-        for fname, _ftype in list(files):
-            # Only resume bots with a persisted hosting clock. Existing uploaded bots
-            # without a clock remain safely stopped and can be started from Manage Files.
-            if get_bot_hosting_started_at(uid, fname) is None or not get_bot_desired_running(uid, fname):
-                continue
-            if not os.path.isfile(os.path.join(get_user_folder(uid), fname)):
-                continue
-            if is_free_hosting_exhausted(uid) and not has_active_plan(uid):
-                continue
-            if is_bot_running(uid, fname):
-                continue
-            try:
-                if do_start_bot(uid, fname, SimpleNamespace(chat=SimpleNamespace(id=int(uid)))):
-                    resumed += 1
-            except Exception as e:
-                logger.warning("Resume failed for %s/%s: %s", uid, fname, e)
-    logger.info("Resumed %d saved bot(s) after startup.", resumed)
 
 if __name__ == "__main__":
     keep_alive()
     Thread(target=auto_stopper, daemon=True).start()
-    Thread(target=resume_saved_bots, daemon=True).start()
-    logger.info("🚀 Premium File Host is starting with %d Telegram bot(s)...", len(BOT_INSTANCES))
-    for idx, real_bot in enumerate(BOT_INSTANCES, 1):
-        Thread(target=_poll_bot, args=(real_bot, f"BOT-{idx}"), daemon=True).start()
+    logger.info(
+        "🚀 Premium File Host is starting with %d valid host Telegram bot(s)...",
+        len(BOT_INSTANCES),
+    )
+    for real_bot, label in zip(BOT_INSTANCES, BOT_INSTANCE_LABELS):
+        Thread(target=_poll_bot, args=(real_bot, label), daemon=True).start()
     while True:
         time.sleep(3600)
