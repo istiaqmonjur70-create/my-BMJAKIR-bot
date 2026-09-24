@@ -1,12 +1,19 @@
 services:
-  - type: worker
-    name: php-hosting-bot
-    env: docker
+  - type: web
+    name: my-bmjakir-bot-1
+    runtime: docker
     dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+
     envVars:
       - key: BOT_TOKEN
         sync: false
+
       - key: ADMIN_ID
         value: "8814363793"
+
       - key: BASE_URL
-        sync: false
+        value: "https://my-bmjakir-bot-1.onrender.com"
+
+      - key: PORT
+        value: "10000"
