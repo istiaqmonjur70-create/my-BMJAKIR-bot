@@ -42,7 +42,7 @@ def keep_alive():
     print("Flask Keep-Alive server started.")
 
 # --- Configuration ---
-TOKEN = os.environ.get("BOT_TOKEN", "8741031738:AAHNwlVXskxpBkmriHsqZeYc8jVnKuBR4No").strip()
+TOKEN = os.environ.get("BOT_TOKEN", "8749694565:AAE-X6sanig394w9iq9lWquXPHw2XLAGsms").strip()
 OWNER_ID = 8814363793
 ADMIN_ID = 8814363793
 YOUR_USERNAME = "@DevCloudX"
@@ -3934,7 +3934,7 @@ def handle_text_messages(message):
 # Keep these values after the main code as requested.
 # Replace only the two placeholders below.
 # =====================================================================
-SECOND_BOT_TOKEN = os.environ.get("SECOND_BOT_TOKEN", "8741031738:AAHNwlVXskxpBkmriHsqZeYc8jVnKuBR4No").strip()
+SECOND_BOT_TOKEN = os.environ.get("SECOND_BOT_TOKEN", "8749694565:AAE-X6sanig394w9iq9lWquXPHw2XLAGsms").strip()
 SECOND_ADMIN_ID = 8814363793  # Legacy compatibility only; never grants admin access.
 
 # SECURITY: only the owner can approve/reject uploads and receive admin controls.
@@ -4020,21 +4020,76 @@ def _register_proxy_handlers():
 _register_proxy_handlers()
 
 # --- App Start ---
+def _prepare_polling(real_bot, label):
+    """Ensure Telegram webhook mode is disabled before getUpdates polling.
+
+    Telegram returns HTTP 409 when a webhook is still configured and the bot
+    tries to use getUpdates. This cleanup is safe to run every startup.
+    """
+    try:
+        # pyTelegramBotAPI supports remove_webhook().
+        remover = getattr(real_bot, "remove_webhook", None)
+        if callable(remover):
+            remover()
+        else:
+            deleter = getattr(real_bot, "delete_webhook", None)
+            if callable(deleter):
+                deleter(drop_pending_updates=False)
+        time.sleep(1.0)
+        try:
+            info = real_bot.get_webhook_info()
+            url = getattr(info, "url", "") or ""
+            if url:
+                logger.warning("%s still has webhook configured: %s", label, url)
+                # One more attempt using the raw API helper when available.
+                try:
+                    real_bot.delete_webhook(drop_pending_updates=False)
+                    time.sleep(1.0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        logger.info("%s webhook cleared; getUpdates polling is ready.", label)
+        return True
+    except Exception as e:
+        logger.error("%s could not clear webhook before polling: %s", label, e, exc_info=True)
+        return False
+
+
 def _poll_bot(real_bot, label):
     bot.bind(real_bot)
+    if not _prepare_polling(real_bot, label):
+        logger.error("%s polling was not started because webhook cleanup failed.", label)
+        return
     logger.info("%s polling started.", label)
     while True:
         try:
-            real_bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
+            # skip_pending keeps old updates from flooding the hosting panel
+            # after a long downtime, while webhook mode is already removed.
+            real_bot.polling(
+                none_stop=True,
+                timeout=60,
+                long_polling_timeout=60,
+                skip_pending=True,
+            )
         except telebot.apihelper.ApiException as e:
             text_error = str(e)
             logger.error("%s Telegram API error: %s", label, e)
+            if "409" in text_error and "webhook" in text_error.lower():
+                logger.warning("%s received webhook 409; clearing webhook and retrying...", label)
+                _prepare_polling(real_bot, label)
+                time.sleep(3)
+                continue
+            if "409" in text_error and "terminated by other getUpdates request" in text_error:
+                logger.warning("%s has another polling process using the same token. Waiting before retry.", label)
+                time.sleep(20)
+                continue
             if "401" in text_error or "Unauthorized" in text_error:
                 logger.error("%s polling stopped: token is invalid/revoked.", label)
                 return
             time.sleep(15)
         except Exception as e:
-            logger.error("%s polling error: %s", label, e)
+            logger.error("%s polling error: %s", label, e, exc_info=True)
             time.sleep(15)
 
 
