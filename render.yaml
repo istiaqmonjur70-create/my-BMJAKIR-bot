@@ -1,0 +1,12 @@
+services:
+  - type: worker
+    name: php-hosting-bot
+    env: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        value: "8814363793"
+      - key: BASE_URL
+        sync: false
