@@ -1,26 +1,31 @@
+# -*- coding: utf-8 -*-
+
 import os
-import re
 import json
 import time
-import signal
-import socket
 import shutil
-import threading
+import socket
+import asyncio
+import logging
 import subprocess
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from datetime import datetime
+from html import escape
 
 from aiohttp import web, ClientSession
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
-
 
 # ============================================================
 # CONFIG
@@ -28,157 +33,130 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8640062161:AAHOKHWzo0naxUpZRmNWdqGUKlYI3wjeXo0").strip()
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "8814363793"))
+ADMIN_ID = int(
+    os.getenv("ADMIN_ID", "8814363793")
+)
+
+PORT = int(
+    os.getenv("PORT", "10000")
+)
 
 BASE_URL = os.getenv(
     "BASE_URL",
     "https://my-bmjakir-bot-1.onrender.com"
 ).rstrip("/")
 
-PORT = int(os.getenv("PORT", "10000"))
-
 DATA_DIR = Path(
-    os.getenv("DATA_DIR", "/app/data")
+    os.getenv(
+        "DATA_DIR",
+        "/app/data"
+    )
 )
 
 PROJECTS_DIR = DATA_DIR / "projects"
-USERS_FILE = DATA_DIR / "users.json"
+DB_FILE = DATA_DIR / "database.json"
 
-MAX_UPLOAD_SIZE = 25 * 1024 * 1024  # 25 MB
-
-PROJECT_NAME_RE = re.compile(
-    r"^[A-Za-z0-9_-]{1,40}$"
+DATA_DIR.mkdir(
+    parents=True,
+    exist_ok=True
 )
 
-ALLOWED_PHP_EXTENSIONS = {
-    ".php"
-}
+PROJECTS_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
-# ============================================================
-# DIRECTORIES
-# ============================================================
-
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
-
-DATA_LOCK = threading.RLock()
-PROCESS_LOCK = threading.RLock()
-
-PROCESSES = {}
+logger = logging.getLogger("PHP-HOST")
 
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-def load_users():
-    with DATA_LOCK:
-        if not USERS_FILE.exists():
-            USERS_FILE.write_text(
-                json.dumps(
-                    {"users": {}},
-                    indent=2
-                ),
+DB = {
+    "users": {},
+    "projects": {}
+}
+
+db_lock = asyncio.Lock()
+
+
+def load_db():
+    global DB
+
+    if not DB_FILE.exists():
+        save_db_sync()
+        return
+
+    try:
+        data = json.loads(
+            DB_FILE.read_text(
                 encoding="utf-8"
             )
+        )
 
-        try:
-            return json.loads(
-                USERS_FILE.read_text(
-                    encoding="utf-8"
-                )
-            )
-        except Exception:
-            return {"users": {}}
+        if isinstance(data, dict):
+            DB = data
+
+        DB.setdefault("users", {})
+        DB.setdefault("projects", {})
+
+    except Exception:
+        logger.exception(
+            "Database load error"
+        )
 
 
-def save_users(data):
-    with DATA_LOCK:
-        tmp = USERS_FILE.with_suffix(".tmp")
-
-        tmp.write_text(
+def save_db_sync():
+    try:
+        DB_FILE.write_text(
             json.dumps(
-                data,
-                indent=2
+                DB,
+                indent=2,
+                ensure_ascii=False
             ),
             encoding="utf-8"
         )
-
-        tmp.replace(USERS_FILE)
-
-
-def ensure_user(user_id):
-    data = load_users()
-
-    uid = str(user_id)
-
-    if uid not in data["users"]:
-        data["users"][uid] = {
-            "created_at": int(time.time()),
-            "projects": {}
-        }
-
-        save_users(data)
-
-    return data
+    except Exception:
+        logger.exception(
+            "Database save error"
+        )
 
 
-def get_projects(user_id):
-    data = load_users()
+async def save_db():
+    async with db_lock:
+        save_db_sync()
 
-    return data["users"].get(
-        str(user_id),
-        {}
-    ).get(
-        "projects",
-        {}
-    )
+
+load_db()
 
 
 # ============================================================
-# PATH HELPERS
+# PROCESS STORAGE
 # ============================================================
 
-def user_root(user_id):
-    path = PROJECTS_DIR / str(user_id)
-    path.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-    return path
+processes = {}
+
+# pending uploaded files
+pending_uploads = {}
 
 
-def project_path(user_id, project):
-    return user_root(user_id) / project
+def project_key(user_id, project):
+    return f"{user_id}:{project}"
 
 
-def safe_filename(filename):
-    filename = os.path.basename(
-        filename or ""
-    )
-
-    filename = re.sub(
-        r"[^A-Za-z0-9._-]",
-        "_",
-        filename
+def project_dir(user_id, project):
+    return (
+        PROJECTS_DIR
+        / str(user_id)
+        / project
     )
 
-    if not filename:
-        filename = "index.php"
-
-    return filename[:120]
-
-
-def valid_project_name(name):
-    return bool(
-        PROJECT_NAME_RE.fullmatch(name)
-    )
-
-
-# ============================================================
-# PORT
-# ============================================================
 
 def get_free_port():
     sock = socket.socket(
@@ -197,252 +175,22 @@ def get_free_port():
     return port
 
 
-# ============================================================
-# PROJECT PROCESS
-# ============================================================
+def valid_project_name(name):
+    if not name:
+        return False
 
-def pid_path(path):
-    return path / ".php.pid"
+    if len(name) > 40:
+        return False
 
-
-def meta_path(path):
-    return path / ".project.json"
-
-
-def log_path(path):
-    return path / "php.log"
-
-
-def get_project_meta(path):
-    file = meta_path(path)
-
-    if not file.exists():
-        return {}
-
-    try:
-        return json.loads(
-            file.read_text(
-                encoding="utf-8"
-            )
-        )
-    except Exception:
-        return {}
-
-
-def save_project_meta(path, data):
-    meta_path(path).write_text(
-        json.dumps(
-            data,
-            indent=2
-        ),
-        encoding="utf-8"
+    allowed = (
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789-_"
     )
 
-
-def get_pid(path):
-    with PROCESS_LOCK:
-
-        process = PROCESSES.get(
-            str(path)
-        )
-
-        if process:
-            if process.poll() is None:
-                return process.pid
-
-            PROCESSES.pop(
-                str(path),
-                None
-            )
-
-        pid_file = pid_path(path)
-
-        if not pid_file.exists():
-            return None
-
-        try:
-            pid = int(
-                pid_file.read_text().strip()
-            )
-
-            os.kill(pid, 0)
-
-            return pid
-
-        except Exception:
-
-            try:
-                pid_file.unlink()
-            except Exception:
-                pass
-
-            return None
-
-
-def is_running(path):
-    return get_pid(path) is not None
-
-
-def start_php_server(
-    user_id,
-    project
-):
-    path = project_path(
-        user_id,
-        project
-    )
-
-    if not path.exists():
-        return False, "Project does not exist."
-
-    index = path / "index.php"
-
-    php_files = list(
-        path.glob("*.php")
-    )
-
-    if not index.exists():
-
-        if not php_files:
-            return False, "No PHP file found."
-
-        shutil.copy2(
-            php_files[0],
-            index
-        )
-
-    if is_running(path):
-        return True, "already_running"
-
-    port = get_free_port()
-
-    logfile = open(
-        log_path(path),
-        "a",
-        encoding="utf-8",
-        buffering=1
-    )
-
-    command = [
-        "php",
-        "-S",
-        f"127.0.0.1:{port}",
-        "-t",
-        str(path)
-    ]
-
-    try:
-
-        process = subprocess.Popen(
-            command,
-            stdout=logfile,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True
-        )
-
-        with PROCESS_LOCK:
-            PROCESSES[str(path)] = process
-
-        pid_path(path).write_text(
-            str(process.pid),
-            encoding="utf-8"
-        )
-
-        save_project_meta(
-            path,
-            {
-                "port": port,
-                "pid": process.pid,
-                "started_at": int(time.time())
-            }
-        )
-
-        return True, port
-
-    except Exception as e:
-
-        try:
-            logfile.close()
-        except Exception:
-            pass
-
-        return False, str(e)
-
-
-def stop_php_server(
-    user_id,
-    project
-):
-    path = project_path(
-        user_id,
-        project
-    )
-
-    process = None
-
-    with PROCESS_LOCK:
-        process = PROCESSES.get(
-            str(path)
-        )
-
-    if process:
-
-        try:
-            process.terminate()
-
-            try:
-                process.wait(
-                    timeout=5
-                )
-            except subprocess.TimeoutExpired:
-                process.kill()
-
-        except Exception:
-            pass
-
-        with PROCESS_LOCK:
-            PROCESSES.pop(
-                str(path),
-                None
-            )
-
-    else:
-
-        pid = get_pid(path)
-
-        if pid:
-
-            try:
-                os.kill(
-                    pid,
-                    signal.SIGTERM
-                )
-            except Exception:
-                pass
-
-    try:
-        pid_path(path).unlink()
-    except Exception:
-        pass
-
-    return True
-
-
-def restart_php_server(
-    user_id,
-    project
-):
-    stop_php_server(
-        user_id,
-        project
-    )
-
-    time.sleep(0.5)
-
-    return start_php_server(
-        user_id,
-        project
+    return all(
+        char in allowed
+        for char in name
     )
 
 
@@ -450,557 +198,801 @@ def restart_php_server(
 # URL
 # ============================================================
 
-def project_url(
+def website_url(
     user_id,
     project
 ):
     return (
-        f"{BASE_URL}"
-        f"/site/{user_id}/{project}/"
+        f"{BASE_URL}/site/"
+        f"{user_id}/"
+        f"{project}/"
     )
 
 
 # ============================================================
-# LOGS
+# START WEBSITE
 # ============================================================
 
-def get_logs(
+async def start_website(
     user_id,
     project
 ):
-    path = project_path(
+    key = project_key(
         user_id,
         project
     )
 
-    file = log_path(path)
+    old = processes.get(key)
 
-    if not file.exists():
-        return "No logs yet."
+    if old:
+        proc = old.get("process")
 
-    try:
-        text = file.read_text(
-            encoding="utf-8",
-            errors="replace"
+        if (
+            proc
+            and proc.poll() is None
+            and old.get("type") == "website"
+        ):
+            return old["port"]
+
+    await stop_project(
+        user_id,
+        project
+    )
+
+    folder = project_dir(
+        user_id,
+        project
+    )
+
+    folder.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    port = get_free_port()
+
+    log_path = (
+        folder / ".server.log"
+    )
+
+    log_handle = open(
+        log_path,
+        "a",
+        encoding="utf-8"
+    )
+
+    command = [
+        "php",
+        "-S",
+        f"127.0.0.1:{port}",
+        "-t",
+        str(folder)
+    ]
+
+    logger.info(
+        "Starting PHP website: %s",
+        key
+    )
+
+    proc = subprocess.Popen(
+        command,
+        cwd=str(folder),
+        stdout=log_handle,
+        stderr=subprocess.STDOUT
+    )
+
+    processes[key] = {
+        "process": proc,
+        "port": port,
+        "type": "website",
+        "log_handle": log_handle,
+        "started_at": time.time()
+    }
+
+    DB["projects"].setdefault(
+        key,
+        {}
+    )
+
+    DB["projects"][key].update({
+        "user_id": int(user_id),
+        "name": project,
+        "type": "website",
+        "port": port,
+        "status": "running"
+    })
+
+    await save_db()
+
+    await asyncio.sleep(1)
+
+    if proc.poll() is not None:
+        processes.pop(
+            key,
+            None
         )
 
-        if len(text) > 6000:
-            text = text[-6000:]
+        try:
+            log_handle.close()
+        except Exception:
+            pass
 
-        return text or "No logs yet."
+        DB["projects"][key][
+            "status"
+        ] = "stopped"
 
-    except Exception as e:
-        return f"Log error: {e}"
+        await save_db()
+
+        raise RuntimeError(
+            "PHP website failed to start."
+        )
+
+    return port
 
 
 # ============================================================
-# PROJECT DELETE
+# START TELEGRAM PHP BOT
 # ============================================================
 
-def delete_project(
+async def start_php_bot(
     user_id,
     project
 ):
-    stop_php_server(
+    key = project_key(
         user_id,
         project
     )
 
-    path = project_path(
+    await stop_project(
         user_id,
         project
     )
 
-    if path.exists():
-        shutil.rmtree(path)
+    folder = project_dir(
+        user_id,
+        project
+    )
 
-    data = load_users()
+    folder.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-    uid = str(user_id)
+    bot_file = DB["projects"].get(
+        key,
+        {}
+    ).get(
+        "bot_file"
+    )
 
-    if (
-        uid in data["users"]
-        and project in data["users"][uid]["projects"]
-    ):
-        del data["users"][uid]["projects"][project]
-
-        save_users(data)
-
-
-# ============================================================
-# TELEGRAM UI
-# ============================================================
-
-def home_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "➕ Upload PHP",
-                callback_data="upload"
-            ),
-            InlineKeyboardButton(
-                "📂 My Projects",
-                callback_data="projects"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📊 Status",
-                callback_data="status"
-            ),
-            InlineKeyboardButton(
-                "📜 Logs",
-                callback_data="logs"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "ℹ️ Help",
-                callback_data="help"
-            )
+    if not bot_file:
+        # automatic detection
+        candidates = [
+            "bot.php",
+            "main.php",
+            "index.php"
         ]
-    ])
+
+        for name in candidates:
+            if (
+                folder / name
+            ).exists():
+                bot_file = name
+                break
+
+    if not bot_file:
+        php_files = list(
+            folder.glob("*.php")
+        )
+
+        if php_files:
+            bot_file = php_files[0].name
+
+    if not bot_file:
+        raise RuntimeError(
+            "No PHP file found."
+        )
+
+    bot_path = folder / bot_file
+
+    if not bot_path.exists():
+        raise RuntimeError(
+            f"{bot_file} not found."
+        )
+
+    log_path = (
+        folder / ".bot.log"
+    )
+
+    log_handle = open(
+        log_path,
+        "a",
+        encoding="utf-8"
+    )
+
+    command = [
+        "php",
+        bot_file
+    ]
+
+    logger.info(
+        "Starting PHP Telegram bot: %s",
+        key
+    )
+
+    proc = subprocess.Popen(
+        command,
+        cwd=str(folder),
+        stdout=log_handle,
+        stderr=subprocess.STDOUT
+    )
+
+    processes[key] = {
+        "process": proc,
+        "port": None,
+        "type": "telegram_bot",
+        "bot_file": bot_file,
+        "log_handle": log_handle,
+        "started_at": time.time()
+    }
+
+    DB["projects"].setdefault(
+        key,
+        {}
+    )
+
+    DB["projects"][key].update({
+        "user_id": int(user_id),
+        "name": project,
+        "type": "telegram_bot",
+        "bot_file": bot_file,
+        "port": None,
+        "status": "running"
+    })
+
+    await save_db()
+
+    await asyncio.sleep(1)
+
+    if proc.poll() is not None:
+        processes.pop(
+            key,
+            None
+        )
+
+        try:
+            log_handle.close()
+        except Exception:
+            pass
+
+        DB["projects"][key][
+            "status"
+        ] = "error"
+
+        await save_db()
+
+        raise RuntimeError(
+            "PHP Telegram bot stopped immediately. "
+            "Open Logs to see the error."
+        )
+
+    return bot_file
 
 
-def project_keyboard(
+# ============================================================
+# STOP
+# ============================================================
+
+async def stop_project(
     user_id,
     project
 ):
-    path = project_path(
+    key = project_key(
         user_id,
         project
     )
 
-    running = is_running(path)
+    item = processes.get(key)
 
-    status = (
-        "🟢 Running"
-        if running
-        else
-        "🔴 Stopped"
+    if item:
+        proc = item.get("process")
+
+        try:
+            if (
+                proc
+                and proc.poll() is None
+            ):
+                proc.terminate()
+
+                try:
+                    proc.wait(
+                        timeout=5
+                    )
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+        except Exception:
+            logger.exception(
+                "Process stop error"
+            )
+
+        try:
+            item[
+                "log_handle"
+            ].close()
+        except Exception:
+            pass
+
+        processes.pop(
+            key,
+            None
+        )
+
+    if key in DB["projects"]:
+        DB["projects"][key][
+            "status"
+        ] = "stopped"
+
+        await save_db()
+
+    return True
+
+
+# ============================================================
+# RESTART
+# ============================================================
+
+async def restart_project(
+    user_id,
+    project
+):
+    info = DB["projects"].get(
+        project_key(
+            user_id,
+            project
+        ),
+        {}
     )
 
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                status,
-                callback_data="noop"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "▶️ Start",
-                callback_data=f"start:{project}"
-            ),
-            InlineKeyboardButton(
-                "⏹ Stop",
-                callback_data=f"stop:{project}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔄 Restart",
-                callback_data=f"restart:{project}"
-            ),
-            InlineKeyboardButton(
-                "📜 Logs",
-                callback_data=f"plogs:{project}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🌐 Open",
-                url=project_url(
-                    user_id,
-                    project
+    ptype = info.get(
+        "type",
+        "website"
+    )
+
+    if ptype == "telegram_bot":
+        return await start_php_bot(
+            user_id,
+            project
+        )
+
+    return await start_website(
+        user_id,
+        project
+    )
+
+
+# ============================================================
+# ZIP EXTRACTION
+# ============================================================
+
+def safe_extract(
+    zip_path,
+    destination
+):
+    destination = destination.resolve()
+
+    import zipfile
+
+    with zipfile.ZipFile(
+        zip_path,
+        "r"
+    ) as archive:
+
+        for member in archive.infolist():
+
+            target = (
+                destination
+                / member.filename
+            ).resolve()
+
+            if not str(target).startswith(
+                str(destination)
+            ):
+                raise ValueError(
+                    "Unsafe ZIP file."
                 )
-            ),
-            InlineKeyboardButton(
-                "🗑 Delete",
-                callback_data=f"delete:{project}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅️ Back",
-                callback_data="projects"
-            )
-        ]
-    ])
+
+            if member.is_dir():
+                target.mkdir(
+                    parents=True,
+                    exist_ok=True
+                )
+            else:
+                target.parent.mkdir(
+                    parents=True,
+                    exist_ok=True
+                )
+
+                with archive.open(
+                    member
+                ) as src:
+
+                    with open(
+                        target,
+                        "wb"
+                    ) as dst:
+
+                        shutil.copyfileobj(
+                            src,
+                            dst
+                        )
 
 
 # ============================================================
-# /START
-# ============================================================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    user = update.effective_user
-
-    ensure_user(user.id)
-
-    context.user_data[
-        "waiting_upload"
-    ] = False
-
-    text = (
-        "╔══════════════════════════╗\n"
-        "        PHP HOSTING\n"
-        "╚══════════════════════════╝\n\n"
-        f"👤 {user.first_name}\n"
-        f"🆔 `{user.id}`\n\n"
-        "Host your PHP projects directly "
-        "from Telegram.\n\n"
-        "• Upload PHP files\n"
-        "• Start / Stop / Restart\n"
-        "• Public PHP URL\n"
-        "• Logs\n"
-        "• Project management\n\n"
-        "Choose an option:"
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=home_keyboard()
-    )
-
-
-# ============================================================
-# UPLOAD COMMAND
-# ============================================================
-
-async def upload_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    context.user_data[
-        "waiting_upload"
-    ] = True
-
-    await update.message.reply_text(
-        "📤 **Send your PHP file now.**\n\n"
-        "Example:\n"
-        "`index.php`\n\n"
-        "Maximum file size: 25 MB",
-        parse_mode="Markdown"
-    )
-
-
-# ============================================================
-# DOCUMENT UPLOAD
+# UPLOAD
 # ============================================================
 
 async def document_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    # IMPORTANT FIX:
+    # Some Telegram updates don't have message/document.
+    if not update:
+        return
+
+    if not update.message:
+        return
+
     document = update.message.document
 
     if not document:
         return
 
-    filename = safe_filename(
-        document.file_name
-    )
-
-    extension = Path(
-        filename
-    ).suffix.lower()
-
-    if extension not in ALLOWED_PHP_EXTENSIONS:
-
-        await update.message.reply_text(
-            "❌ Only `.php` files are allowed."
-        )
-
-        return
-
-    if (
-        document.file_size
-        and
-        document.file_size > MAX_UPLOAD_SIZE
-    ):
-
-        await update.message.reply_text(
-            "❌ File too large.\n\n"
-            "Maximum: 25 MB."
-        )
-
-        return
-
     user = update.effective_user
 
+    if not user:
+        return
+
+    filename = (
+        document.file_name
+        or "upload"
+    )
+
+    lower = filename.lower()
+
+    if not (
+        lower.endswith(".zip")
+        or lower.endswith(".php")
+        or lower.endswith(".html")
+    ):
+        await update.message.reply_text(
+            "❌ শুধু ZIP, PHP অথবা HTML file upload করুন।"
+        )
+        return
+
+    project_name = Path(
+        filename
+    ).stem
+
+    project_name = "".join(
+        c for c in project_name
+        if (
+            c.isalnum()
+            or c in "-_"
+        )
+    )
+
+    if not project_name:
+        project_name = (
+            f"project_{int(time.time())}"
+        )
+
+    if len(project_name) > 35:
+        project_name = project_name[:35]
+
+    user_folder = (
+        PROJECTS_DIR
+        / str(user.id)
+    )
+
+    user_folder.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    final_folder = (
+        user_folder
+        / project_name
+    )
+
+    if final_folder.exists():
+        project_name = (
+            f"{project_name}_"
+            f"{int(time.time())}"
+        )
+
+        final_folder = (
+            user_folder
+            / project_name
+        )
+
+    final_folder.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
     await update.message.reply_text(
-        "⏳ Uploading PHP file..."
+        "⏳ File download হচ্ছে..."
     )
 
     try:
-
-        ensure_user(
-            user.id
+        tg_file = await context.bot.get_file(
+            document.file_id
         )
 
-        tg_file = await document.get_file()
-
-        original_project = Path(
-            filename
-        ).stem
-
-        original_project = re.sub(
-            r"[^A-Za-z0-9_-]",
-            "_",
-            original_project
-        )
-
-        if not original_project:
-            original_project = "project"
-
-        original_project = original_project[:30]
-
-        project = original_project
-
-        counter = 1
-
-        while project_path(
-            user.id,
-            project
-        ).exists():
-
-            project = (
-                f"{original_project}_{counter}"
+        temp = (
+            user_folder
+            / (
+                f".upload_"
+                f"{int(time.time())}_"
+                f"{filename}"
             )
-
-            counter += 1
-
-        path = project_path(
-            user.id,
-            project
         )
-
-        path.mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
-        destination = path / filename
 
         await tg_file.download_to_drive(
-            custom_path=str(destination)
+            custom_path=str(temp)
         )
 
-        if filename.lower() != "index.php":
-
-            shutil.copy2(
-                destination,
-                path / "index.php"
-            )
-
-        data = load_users()
-
-        uid = str(user.id)
-
-        data["users"][uid][
-            "projects"
-        ][project] = {
-            "filename": filename,
-            "created_at": int(time.time())
-        }
-
-        save_users(data)
-
-        ok, result = start_php_server(
-            user.id,
-            project
-        )
-
-        if not ok:
+        if lower.endswith(".zip"):
 
             await update.message.reply_text(
-                "⚠️ File uploaded, but PHP "
-                "server could not start.\n\n"
-                f"Error:\n`{result}`",
-                parse_mode="Markdown"
+                "📦 ZIP extract হচ্ছে..."
             )
 
-            return
+            safe_extract(
+                temp,
+                final_folder
+            )
 
-        url = project_url(
+            temp.unlink(
+                missing_ok=True
+            )
+
+        else:
+
+            target = (
+                final_folder
+                / filename
+            )
+
+            shutil.move(
+                str(temp),
+                str(target)
+            )
+
+        key = project_key(
             user.id,
-            project
+            project_name
         )
 
-        text = (
-            "╔══════════════════════════╗\n"
-            "       PHP UPLOADED\n"
-            "╚══════════════════════════╝\n\n"
-            f"📁 Project: `{project}`\n"
-            f"📄 File: `{filename}`\n"
-            "🟢 Status: Running\n\n"
-            f"🌐 URL:\n{url}\n\n"
-            "Your PHP project is ready."
-        )
+        DB["projects"][key] = {
+            "user_id": user.id,
+            "name": project_name,
+            "type": "pending",
+            "status": "stopped",
+            "bot_file": None,
+            "created_at": datetime.utcnow().isoformat()
+        }
 
+        await save_db()
+
+        # Ask mode
         await update.message.reply_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=project_keyboard(
-                user.id,
-                project
-            )
+            "✅ <b>File uploaded!</b>\n\n"
+            "আপনি এই project-টি কী হিসেবে চালাতে চান?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🌐 PHP Website",
+                        callback_data=(
+                            f"mode_web:"
+                            f"{user.id}:"
+                            f"{project_name}"
+                        )
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🤖 PHP Telegram Bot",
+                        callback_data=(
+                            f"mode_bot:"
+                            f"{user.id}:"
+                            f"{project_name}"
+                        )
+                    )
+                ]
+            ])
         )
-
-        context.user_data[
-            "waiting_upload"
-        ] = False
 
     except Exception as e:
 
+        logger.exception(
+            "Upload failed"
+        )
+
+        shutil.rmtree(
+            final_folder,
+            ignore_errors=True
+        )
+
         await update.message.reply_text(
             "❌ Upload failed.\n\n"
-            f"`{e}`",
-            parse_mode="Markdown"
+            f"<code>{escape(str(e))}</code>",
+            parse_mode="HTML"
         )
 
 
 # ============================================================
-# PROJECT LIST
+# PROJECT KEYBOARD
 # ============================================================
 
-async def projects_page(
-    query,
-    user_id
-):
-    projects = get_projects(
-        user_id
-    )
-
-    keyboard = []
-
-    for project in projects:
-
-        running = is_running(
-            project_path(
-                user_id,
-                project
-            )
-        )
-
-        icon = (
-            "🟢"
-            if running
-            else
-            "🔴"
-        )
-
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{icon} {project}",
-                callback_data=f"project:{project}"
-            )
-        ])
-
-    keyboard.append([
-        InlineKeyboardButton(
-            "➕ Upload",
-            callback_data="upload"
-        )
-    ])
-
-    keyboard.append([
-        InlineKeyboardButton(
-            "⬅️ Home",
-            callback_data="home"
-        )
-    ])
-
-    text = (
-        "╔══════════════════════════╗\n"
-        "         MY PROJECTS\n"
-        "╚══════════════════════════╝\n\n"
-    )
-
-    if not projects:
-        text += (
-            "No projects yet.\n\n"
-            "Upload a PHP file to create one."
-        )
-    else:
-        text += (
-            f"Total: {len(projects)}\n\n"
-            "Select a project:"
-        )
-
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        )
-    )
-
-
-# ============================================================
-# PROJECT PAGE
-# ============================================================
-
-async def project_page(
-    query,
+def project_keyboard(
     user_id,
     project
 ):
-    projects = get_projects(
-        user_id
-    )
-
-    if project not in projects:
-
-        await query.answer(
-            "Project not found.",
-            show_alert=True
-        )
-
-        return
-
-    path = project_path(
+    key = project_key(
         user_id,
         project
     )
 
-    running = is_running(path)
-
-    meta = get_project_meta(
-        path
+    info = DB["projects"].get(
+        key,
+        {}
     )
 
-    port = meta.get(
-        "port",
-        "N/A"
+    ptype = info.get(
+        "type",
+        "website"
     )
 
-    status = (
-        "🟢 Running"
-        if running
-        else
-        "🔴 Stopped"
+    buttons = []
+
+    if ptype == "website":
+
+        buttons.append([
+            InlineKeyboardButton(
+                "🌐 Open Website",
+                url=website_url(
+                    user_id,
+                    project
+                )
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "▶️ Start",
+            callback_data=(
+                f"start:"
+                f"{user_id}:"
+                f"{project}"
+            )
+        ),
+        InlineKeyboardButton(
+            "⏹ Stop",
+            callback_data=(
+                f"stop:"
+                f"{user_id}:"
+                f"{project}"
+            )
+        )
+    ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "🔄 Restart",
+            callback_data=(
+                f"restart:"
+                f"{user_id}:"
+                f"{project}"
+            )
+        ),
+        InlineKeyboardButton(
+            "📄 Logs",
+            callback_data=(
+                f"logs:"
+                f"{user_id}:"
+                f"{project}"
+            )
+        )
+    ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "🗑 Delete",
+            callback_data=(
+                f"delete:"
+                f"{user_id}:"
+                f"{project}"
+            )
+        )
+    ])
+
+    return InlineKeyboardMarkup(
+        buttons
     )
+
+
+# ============================================================
+# PROJECT MENU
+# ============================================================
+
+async def show_project(
+    query,
+    user_id,
+    project
+):
+    key = project_key(
+        user_id,
+        project
+    )
+
+    info = DB["projects"].get(
+        key,
+        {}
+    )
+
+    if not info:
+        await query.edit_message_text(
+            "❌ Project not found."
+        )
+        return
+
+    ptype = info.get(
+        "type",
+        "website"
+    )
+
+    status = info.get(
+        "status",
+        "stopped"
+    )
+
+    if ptype == "telegram_bot":
+        type_text = "Telegram PHP Bot"
+    elif ptype == "website":
+        type_text = "PHP Website"
+    else:
+        type_text = "Not selected"
 
     text = (
-        "╔══════════════════════════╗\n"
-        "        PROJECT PANEL\n"
-        "╚══════════════════════════╝\n\n"
-        f"📁 Project: `{project}`\n"
-        f"📄 File: `{projects[project].get('filename', 'index.php')}`\n"
-        f"📡 Status: {status}\n"
-        f"🔌 Internal Port: `{port}`\n\n"
-        f"🌐 URL:\n"
-        f"{project_url(user_id, project)}"
+        f"📦 <b>{escape(project)}</b>\n\n"
+        f"Type: <b>{type_text}</b>\n"
+        f"Status: <b>{escape(status.upper())}</b>\n"
     )
+
+    if ptype == "website":
+        text += (
+            "\n🌐 <b>Website URL:</b>\n"
+            f"{escape(website_url(user_id, project))}\n"
+        )
+
+    if ptype == "telegram_bot":
+        bot_file = info.get(
+            "bot_file",
+            "Unknown"
+        )
+
+        text += (
+            f"\n🤖 Bot File: "
+            f"<code>{escape(bot_file)}</code>\n"
+        )
 
     await query.edit_message_text(
         text,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=project_keyboard(
             user_id,
             project
@@ -1009,180 +1001,265 @@ async def project_page(
 
 
 # ============================================================
-# CALLBACK
+# MY PROJECTS
 # ============================================================
 
-async def callback_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+async def my_projects(
+    update,
+    context
 ):
-    query = update.callback_query
-
-    await query.answer()
-
     user = update.effective_user
 
-    data = query.data
+    projects = []
 
-    if data == "noop":
-        return
+    for info in DB[
+        "projects"
+    ].values():
 
-    if data == "home":
-
-        await query.edit_message_text(
-            "╔══════════════════════════╗\n"
-            "        PHP HOSTING\n"
-            "╚══════════════════════════╝\n\n"
-            "Choose an option:",
-            reply_markup=home_keyboard()
-        )
-
-        return
-
-    if data == "upload":
-
-        context.user_data[
-            "waiting_upload"
-        ] = True
-
-        await query.edit_message_text(
-            "📤 **UPLOAD PHP FILE**\n\n"
-            "Send your `.php` file now.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Back",
-                        callback_data="home"
-                    )
-                ]
-            ])
-        )
-
-        return
-
-    if data == "projects":
-
-        await projects_page(
-            query,
-            user.id
-        )
-
-        return
-
-    if data == "status":
-
-        projects = get_projects(
-            user.id
-        )
-
-        lines = [
-            "╔══════════════════════════╗",
-            "         PROJECT STATUS",
-            "╚══════════════════════════╝",
-            ""
-        ]
-
-        if not projects:
-
-            lines.append(
-                "No projects."
+        if int(
+            info.get(
+                "user_id",
+                0
             )
+        ) == user.id:
 
-        else:
+            projects.append(info)
 
-            for project in projects:
+    buttons = []
 
-                running = is_running(
-                    project_path(
-                        user.id,
-                        project
-                    )
-                )
+    for info in projects:
 
-                status = (
-                    "🟢 RUNNING"
-                    if running
-                    else
-                    "🔴 STOPPED"
-                )
-
-                lines.append(
-                    f"📁 `{project}` — {status}"
-                )
-
-        await query.edit_message_text(
-            "\n".join(lines),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Home",
-                        callback_data="home"
-                    )
-                ]
-            ])
+        name = info.get(
+            "name",
+            "Unknown"
         )
 
-        return
-
-    if data == "logs":
-
-        projects = get_projects(
-            user.id
+        status = info.get(
+            "status",
+            "stopped"
         )
 
-        keyboard = []
-
-        for project in projects:
-
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"📜 {project}",
-                    callback_data=f"plogs:{project}"
-                )
-            ])
-
-        keyboard.append([
+        buttons.append([
             InlineKeyboardButton(
-                "⬅️ Home",
-                callback_data="home"
+                f"📦 {name} [{status}]",
+                callback_data=(
+                    f"project:"
+                    f"{user.id}:"
+                    f"{name}"
+                )
             )
         ])
 
-        await query.edit_message_text(
-            "📜 **SELECT PROJECT LOGS**",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(
-                keyboard
+    text = (
+        "📂 <b>My Projects</b>\n\n"
+        "আপনার project নির্বাচন করুন।"
+    )
+
+    if not buttons:
+        text = (
+            "📂 <b>My Projects</b>\n\n"
+            "কোনো project নেই।"
+        )
+
+    markup = InlineKeyboardMarkup(
+        buttons
+    ) if buttons else None
+
+    if update.callback_query:
+
+        await update.callback_query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=markup
+        )
+
+    else:
+
+        await update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=markup
+        )
+
+
+# ============================================================
+# START COMMAND
+# ============================================================
+
+async def start_command(
+    update,
+    context
+):
+    # Important safety check
+    if not update.message:
+        return
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    uid = str(
+        user.id
+    )
+
+    DB["users"].setdefault(
+        uid,
+        {
+            "id": user.id,
+            "name": user.full_name,
+            "username": user.username or ""
+        }
+    )
+
+    await save_db()
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                "📤 Upload PHP",
+                callback_data="upload"
             )
+        ],
+        [
+            InlineKeyboardButton(
+                "📂 My Projects",
+                callback_data="my_projects"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "ℹ️ Help",
+                callback_data="help"
+            )
+        ]
+    ]
+
+    if user.id == ADMIN_ID:
+        buttons.append([
+            InlineKeyboardButton(
+                "⚙️ Admin",
+                callback_data="admin"
+            )
+        ])
+
+    await update.message.reply_text(
+        "🚀 <b>PHP HOSTING BOT</b>\n\n"
+        "PHP Website অথবা PHP Telegram Bot host করুন।\n\n"
+        "📤 ZIP/PHP/HTML upload করুন।\n"
+        "তারপর Website অথবা Telegram Bot mode নির্বাচন করুন।",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            buttons
+        )
+    )
+
+
+# ============================================================
+# CALLBACK HANDLER
+# ============================================================
+
+async def callback_handler(
+    update,
+    context
+):
+    query = update.callback_query
+
+    if not query:
+        return
+
+    await query.answer()
+
+    data = query.data or ""
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    # --------------------------------------------------------
+    # UPLOAD
+    # --------------------------------------------------------
+
+    if data == "upload":
+
+        await query.edit_message_text(
+            "📤 <b>PHP File Upload</b>\n\n"
+            "একটি ZIP, PHP অথবা HTML file এই chat-এ পাঠান।\n\n"
+            "Upload-এর পর Website অথবা Telegram Bot নির্বাচন করতে পারবেন।",
+            parse_mode="HTML"
         )
 
         return
+
+    # --------------------------------------------------------
+    # HELP
+    # --------------------------------------------------------
 
     if data == "help":
 
         await query.edit_message_text(
-            "╔══════════════════════════╗\n"
-            "            HELP\n"
-            "╚══════════════════════════╝\n\n"
-            "1. Upload a `.php` file.\n"
-            "2. Bot creates a separate project.\n"
-            "3. PHP server starts automatically.\n"
-            "4. You receive a public URL.\n"
-            "5. Manage it from Project Panel.\n\n"
-            "Controls:\n"
+            "ℹ️ <b>PHP Hosting</b>\n\n"
+            "🌐 Website mode:\n"
+            "PHP website live URL পাবেন।\n\n"
+            "🤖 Telegram Bot mode:\n"
+            "PHP file background process হিসেবে চলবে।\n\n"
             "▶️ Start\n"
             "⏹ Stop\n"
             "🔄 Restart\n"
-            "📜 Logs\n"
-            "🌐 Open\n"
-            "🗑 Delete",
+            "📄 Logs",
+            parse_mode="HTML"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # MY PROJECTS
+    # --------------------------------------------------------
+
+    if data == "my_projects":
+
+        await my_projects(
+            update,
+            context
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # ADMIN
+    # --------------------------------------------------------
+
+    if data == "admin":
+
+        if user.id != ADMIN_ID:
+            return
+
+        total_users = len(
+            DB["users"]
+        )
+
+        total_projects = len(
+            DB["projects"]
+        )
+
+        running = sum(
+            1
+            for p in DB["projects"].values()
+            if p.get("status") == "running"
+        )
+
+        await query.edit_message_text(
+            "⚙️ <b>ADMIN PANEL</b>\n\n"
+            f"👤 Users: {total_users}\n"
+            f"📦 Projects: {total_projects}\n"
+            f"🟢 Running: {running}",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "⬅️ Home",
-                        callback_data="home"
+                        "🔄 Refresh",
+                        callback_data="admin"
                     )
                 ]
             ])
@@ -1190,24 +1267,196 @@ async def callback_handler(
 
         return
 
-    if ":" not in data:
+    # --------------------------------------------------------
+    # MODE WEBSITE
+    # --------------------------------------------------------
+
+    if data.startswith(
+        "mode_web:"
+    ):
+
+        parts = data.split(
+            ":",
+            2
+        )
+
+        if len(parts) != 3:
+            return
+
+        user_id = int(
+            parts[1]
+        )
+
+        project = parts[2]
+
+        if user_id != user.id:
+            return
+
+        key = project_key(
+            user_id,
+            project
+        )
+
+        if key not in DB["projects"]:
+            return
+
+        DB["projects"][key][
+            "type"
+        ] = "website"
+
+        await save_db()
+
+        await query.edit_message_text(
+            "⏳ PHP Website start হচ্ছে..."
+        )
+
+        try:
+
+            await start_website(
+                user_id,
+                project
+            )
+
+            await show_project(
+                query,
+                user_id,
+                project
+            )
+
+        except Exception as e:
+
+            await query.edit_message_text(
+                "❌ Website start failed:\n\n"
+                f"<code>{escape(str(e))}</code>",
+                parse_mode="HTML"
+            )
+
         return
 
-    action, project = data.split(
-        ":",
-        1
-    )
+    # --------------------------------------------------------
+    # MODE BOT
+    # --------------------------------------------------------
 
-    projects = get_projects(
-        user.id
-    )
+    if data.startswith(
+        "mode_bot:"
+    ):
 
-    if project not in projects:
-
-        await query.answer(
-            "Project not found.",
-            show_alert=True
+        parts = data.split(
+            ":",
+            2
         )
+
+        if len(parts) != 3:
+            return
+
+        user_id = int(
+            parts[1]
+        )
+
+        project = parts[2]
+
+        if user_id != user.id:
+            return
+
+        key = project_key(
+            user_id,
+            project
+        )
+
+        if key not in DB["projects"]:
+            return
+
+        DB["projects"][key][
+            "type"
+        ] = "telegram_bot"
+
+        # Find bot file
+        folder = project_dir(
+            user_id,
+            project
+        )
+
+        bot_file = None
+
+        for name in [
+            "bot.php",
+            "main.php"
+        ]:
+
+            if (
+                folder / name
+            ).exists():
+
+                bot_file = name
+                break
+
+        if not bot_file:
+
+            php_files = list(
+                folder.glob(
+                    "*.php"
+                )
+            )
+
+            if php_files:
+                bot_file = (
+                    php_files[0].name
+                )
+
+        DB["projects"][key][
+            "bot_file"
+        ] = bot_file
+
+        await save_db()
+
+        if not bot_file:
+
+            await query.edit_message_text(
+                "❌ কোনো PHP file পাওয়া যায়নি।"
+            )
+
+            return
+
+        await query.edit_message_text(
+            "🤖 <b>PHP Telegram Bot</b>\n\n"
+            f"File: <code>{escape(bot_file)}</code>\n\n"
+            "⏳ Bot start হচ্ছে...",
+            parse_mode="HTML"
+        )
+
+        try:
+
+            await start_php_bot(
+                user_id,
+                project
+            )
+
+            await show_project(
+                query,
+                user_id,
+                project
+            )
+
+        except Exception as e:
+
+            await query.edit_message_text(
+                "❌ PHP Bot start failed.\n\n"
+                f"<code>{escape(str(e))}</code>\n\n"
+                "📄 Logs থেকে বিস্তারিত error দেখুন।",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "📄 Logs",
+                            callback_data=(
+                                f"logs:"
+                                f"{user_id}:"
+                                f"{project}"
+                            )
+                        )
+                    ]
+                ])
+            )
 
         return
 
@@ -1215,345 +1464,259 @@ async def callback_handler(
     # PROJECT
     # --------------------------------------------------------
 
-    if action == "project":
+    if data.startswith(
+        "project:"
+    ):
 
-        await project_page(
+        parts = data.split(
+            ":",
+            2
+        )
+
+        if len(parts) != 3:
+            return
+
+        user_id = int(
+            parts[1]
+        )
+
+        project = parts[2]
+
+        if user_id != user.id:
+            return
+
+        await show_project(
             query,
-            user.id,
+            user_id,
             project
         )
 
         return
 
     # --------------------------------------------------------
-    # START
+    # START / STOP / RESTART / LOGS / DELETE
     # --------------------------------------------------------
+
+    parts = data.split(
+        ":",
+        2
+    )
+
+    if len(parts) != 3:
+        return
+
+    action = parts[0]
+
+    if action not in {
+        "start",
+        "stop",
+        "restart",
+        "logs",
+        "delete"
+    }:
+        return
+
+    user_id = int(
+        parts[1]
+    )
+
+    project = parts[2]
+
+    if user_id != user.id:
+        return
+
+    key = project_key(
+        user_id,
+        project
+    )
+
+    if key not in DB["projects"]:
+        await query.edit_message_text(
+            "❌ Project not found."
+        )
+        return
 
     if action == "start":
 
-        ok, result = start_php_server(
-            user.id,
-            project
-        )
+        info = DB["projects"][key]
 
-        if ok:
+        if info.get(
+            "type"
+        ) == "telegram_bot":
 
-            await query.answer(
-                "Project started."
+            await start_php_bot(
+                user_id,
+                project
             )
 
         else:
 
-            await query.answer(
-                f"Error: {result}",
-                show_alert=True
+            await start_website(
+                user_id,
+                project
             )
 
-        await project_page(
+        await show_project(
             query,
-            user.id,
+            user_id,
             project
         )
 
-        return
+    elif action == "stop":
 
-    # --------------------------------------------------------
-    # STOP
-    # --------------------------------------------------------
-
-    if action == "stop":
-
-        stop_php_server(
-            user.id,
+        await stop_project(
+            user_id,
             project
         )
 
-        await query.answer(
-            "Project stopped."
-        )
-
-        await project_page(
+        await show_project(
             query,
-            user.id,
+            user_id,
             project
         )
 
-        return
+    elif action == "restart":
 
-    # --------------------------------------------------------
-    # RESTART
-    # --------------------------------------------------------
-
-    if action == "restart":
-
-        ok, result = restart_php_server(
-            user.id,
+        await restart_project(
+            user_id,
             project
         )
 
-        if ok:
+        await show_project(
+            query,
+            user_id,
+            project
+        )
 
-            await query.answer(
-                "Project restarted."
+    elif action == "logs":
+
+        folder = project_dir(
+            user_id,
+            project
+        )
+
+        info = DB["projects"].get(
+            key,
+            {}
+        )
+
+        if info.get(
+            "type"
+        ) == "telegram_bot":
+
+            log_file = (
+                folder / ".bot.log"
             )
 
         else:
 
-            await query.answer(
-                f"Error: {result}",
-                show_alert=True
+            log_file = (
+                folder / ".server.log"
             )
 
-        await project_page(
-            query,
-            user.id,
-            project
-        )
+        if not log_file.exists():
 
-        return
+            text = (
+                "📄 কোনো log পাওয়া যায়নি।"
+            )
 
-    # --------------------------------------------------------
-    # LOGS
-    # --------------------------------------------------------
+        else:
 
-    if action == "plogs":
+            content = log_file.read_text(
+                encoding="utf-8",
+                errors="ignore"
+            )
 
-        logs = get_logs(
-            user.id,
-            project
-        )
+            if len(content) > 3800:
+                content = content[-3800:]
 
-        safe_logs = logs.replace(
-            "```",
-            "'''"
-        )
-
-        text = (
-            f"📜 **LOGS — {project}**\n\n"
-            f"```text\n"
-            f"{safe_logs}\n"
-            f"```"
-        )
+            text = (
+                f"📄 <b>{escape(project)} Logs</b>\n\n"
+                f"<pre>{escape(content)}</pre>"
+            )
 
         await query.edit_message_text(
             text,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "⬅️ Project",
-                        callback_data=f"project:{project}"
+                        "⬅️ Back",
+                        callback_data=(
+                            f"project:"
+                            f"{user_id}:"
+                            f"{project}"
+                        )
                     )
                 ]
             ])
         )
 
-        return
+    elif action == "delete":
 
-    # --------------------------------------------------------
-    # DELETE CONFIRM
-    # --------------------------------------------------------
-
-    if action == "delete":
-
-        await query.edit_message_text(
-            "⚠️ **DELETE PROJECT?**\n\n"
-            f"Project: `{project}`\n\n"
-            "All uploaded PHP files and logs "
-            "will be deleted.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "❌ Yes, Delete",
-                        callback_data=f"confirmdelete:{project}"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Cancel",
-                        callback_data=f"project:{project}"
-                    )
-                ]
-            ])
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # CONFIRM DELETE
-    # --------------------------------------------------------
-
-    if action == "confirmdelete":
-
-        delete_project(
-            user.id,
+        await stop_project(
+            user_id,
             project
         )
 
+        shutil.rmtree(
+            project_dir(
+                user_id,
+                project
+            ),
+            ignore_errors=True
+        )
+
+        DB["projects"].pop(
+            key,
+            None
+        )
+
+        await save_db()
+
         await query.edit_message_text(
-            f"🗑 `{project}` deleted successfully.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "📂 My Projects",
-                        callback_data="projects"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🏠 Home",
-                        callback_data="home"
-                    )
-                ]
-            ])
+            "✅ Project deleted successfully."
         )
-
-        return
-
-
-# ============================================================
-# ADMIN
-# ============================================================
-
-async def admin_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    user = update.effective_user
-
-    if user.id != ADMIN_ID:
-
-        await update.message.reply_text(
-            "❌ Admin only."
-        )
-
-        return
-
-    data = load_users()
-
-    users = len(
-        data.get(
-            "users",
-            {}
-        )
-    )
-
-    projects = 0
-
-    for item in data.get(
-        "users",
-        {}
-    ).values():
-
-        projects += len(
-            item.get(
-                "projects",
-                {}
-            )
-        )
-
-    running = 0
-
-    for item in data.get(
-        "users",
-        {}
-    ).items():
-
-        uid, user_data = item
-
-        for project in user_data.get(
-            "projects",
-            {}
-        ):
-
-            if is_running(
-                project_path(
-                    uid,
-                    project
-                )
-            ):
-                running += 1
-
-    text = (
-        "╔══════════════════════════╗\n"
-        "          ADMIN PANEL\n"
-        "╚══════════════════════════╝\n\n"
-        f"👥 Users: {users}\n"
-        f"📦 Projects: {projects}\n"
-        f"🟢 Running: {running}\n"
-        f"🌐 URL: {BASE_URL}\n"
-        f"🔌 Port: {PORT}"
-    )
-
-    await update.message.reply_text(
-        text
-    )
-
-
-# ============================================================
-# TEXT
-# ============================================================
-
-async def text_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if context.user_data.get(
-        "waiting_upload"
-    ):
-
-        await update.message.reply_text(
-            "📤 Send the PHP file as a document.\n\n"
-            "Example: `index.php`",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    await update.message.reply_text(
-        "Use /start to open the PHP Hosting panel."
-    )
 
 
 # ============================================================
 # PUBLIC WEB SERVER
 # ============================================================
 
-async def health(request):
-    return web.json_response({
-        "status": "ok",
-        "service": "PHP Hosting",
-        "time": int(time.time())
-    })
-
-
-async def root(request):
+async def home(request):
     return web.Response(
         text=(
-            "PHP Hosting Server is online.\n\n"
-            "Use Telegram bot to manage projects."
+            "<!doctype html>"
+            "<html>"
+            "<head>"
+            "<meta charset='utf-8'>"
+            "<meta name='viewport' "
+            "content='width=device-width,initial-scale=1'>"
+            "<title>PHP Hosting</title>"
+            "</head>"
+            "<body style='margin:0;"
+            "background:#080b14;color:white;"
+            "font-family:Arial;text-align:center;"
+            "padding-top:70px'>"
+            "<h1>PHP Hosting Server</h1>"
+            "<p>ONLINE</p>"
+            "<p>PHP Website + PHP Telegram Bot Hosting</p>"
+            "</body>"
+            "</html>"
         ),
-        content_type="text/plain"
+        content_type="text/html"
     )
 
 
-async def project_proxy(
-    request
-):
-    """
-    Public URL:
+async def health(request):
+    return web.json_response({
+        "status": "ok",
+        "service": "php-hosting",
+        "time": datetime.utcnow().isoformat()
+    })
 
-    /site/{user_id}/{project}/...
 
-    Example:
-
-    /site/123456/index/
-
-    is proxied to the user's local PHP server.
-    """
-
+async def proxy_site(request):
     user_id = request.match_info[
         "user_id"
     ]
@@ -1562,98 +1725,98 @@ async def project_proxy(
         "project"
     ]
 
-    remaining = request.match_info.get(
+    path = request.match_info.get(
         "path",
         ""
     )
 
-    if not user_id.isdigit():
-        raise web.HTTPNotFound()
-
-    if not valid_project_name(project):
-        raise web.HTTPNotFound()
-
-    path = project_path(
+    key = project_key(
         user_id,
         project
     )
 
-    if not path.exists():
-        raise web.HTTPNotFound(
+    info = DB["projects"].get(
+        key
+    )
+
+    if not info:
+        return web.Response(
+            status=404,
             text="Project not found."
         )
 
-    if not is_running(path):
-
-        # Automatically start stopped project.
-        ok, result = start_php_server(
-            int(user_id),
-            project
+    if info.get(
+        "type"
+    ) != "website":
+        return web.Response(
+            status=400,
+            text="This project is a Telegram bot."
         )
 
-        if not ok:
-            raise web.HTTPServiceUnavailable(
-                text="PHP server is not running."
+    folder = project_dir(
+        user_id,
+        project
+    )
+
+    if not folder.exists():
+        return web.Response(
+            status=404,
+            text="Project files not found."
+        )
+
+    item = processes.get(key)
+
+    if (
+        not item
+        or not item.get("process")
+        or item["process"].poll() is not None
+    ):
+
+        try:
+            port = await start_website(
+                int(user_id),
+                project
             )
 
-    meta = get_project_meta(
-        path
-    )
+        except Exception as e:
 
-    port = meta.get(
-        "port"
-    )
+            return web.Response(
+                status=500,
+                text=f"PHP server failed: {e}"
+            )
 
-    if not port:
-        raise web.HTTPServiceUnavailable(
-            text="PHP server port unavailable."
-        )
-
-    if remaining:
-        upstream_path = "/" + remaining
     else:
-        upstream_path = "/"
 
-    query = request.query_string
+        port = item["port"]
 
-    if query:
-        upstream_path += "?" + query
+    target_path = "/" + path
 
-    upstream_url = (
+    target_url = (
         f"http://127.0.0.1:"
         f"{port}"
-        f"{upstream_path}"
+        f"{target_path}"
     )
 
-    body = await request.read()
+    if request.query_string:
+        target_url += (
+            "?"
+            + request.query_string
+        )
 
     headers = {}
 
-    skip_headers = {
-        "host",
-        "content-length",
-        "connection",
-        "transfer-encoding",
-        "upgrade",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer"
-    }
+    for name, value in request.headers.items():
 
-    for key, value in request.headers.items():
-
-        if key.lower() in skip_headers:
+        if name.lower() in {
+            "host",
+            "content-length",
+            "connection"
+        }:
             continue
 
-        headers[key] = value
+        headers[name] = value
 
-    headers["Host"] = (
-        f"127.0.0.1:{port}"
-    )
-
-    timeout = 60
+    body = await request.read()
 
     try:
 
@@ -1661,29 +1824,26 @@ async def project_proxy(
 
             async with session.request(
                 request.method,
-                upstream_url,
+                target_url,
                 headers=headers,
                 data=body,
-                allow_redirects=False,
-                timeout=timeout
+                allow_redirects=False
             ) as response:
 
                 response_body = await response.read()
 
                 response_headers = {}
 
-                for key, value in response.headers.items():
+                for name, value in response.headers.items():
 
-                    if key.lower() in {
+                    if name.lower() in {
                         "content-length",
                         "transfer-encoding",
                         "connection"
                     }:
                         continue
 
-                    response_headers[
-                        key
-                    ] = value
+                    response_headers[name] = value
 
                 return web.Response(
                     status=response.status,
@@ -1693,27 +1853,28 @@ async def project_proxy(
 
     except Exception as e:
 
+        logger.exception(
+            "Proxy error"
+        )
+
         return web.Response(
             status=502,
-            text=(
-                "PHP upstream error.\n\n"
-                f"{e}"
-            )
+            text=f"Bad Gateway: {e}"
         )
 
 
 # ============================================================
-# WEB SERVER THREAD
+# WEB SERVER
 # ============================================================
 
-def run_web_server():
+async def start_web():
     app = web.Application(
-        client_max_size=MAX_UPLOAD_SIZE
+        client_max_size=100 * 1024 * 1024
     )
 
     app.router.add_get(
         "/",
-        root
+        home
     )
 
     app.router.add_get(
@@ -1724,27 +1885,87 @@ def run_web_server():
     app.router.add_route(
         "*",
         "/site/{user_id}/{project}/{path:.*}",
-        project_proxy
+        proxy_site
     )
 
-    print(
-        f"Web server listening on "
-        f"0.0.0.0:{PORT}"
+    runner = web.AppRunner(
+        app
     )
 
-    web.run_app(
-        app,
-        host="0.0.0.0",
-        port=PORT,
-        print=None
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PORT
     )
+
+    await site.start()
+
+    logger.info(
+        "======================================"
+    )
+
+    logger.info(
+        "WEB SERVER LISTENING ON 0.0.0.0:%s",
+        PORT
+    )
+
+    logger.info(
+        "BASE URL: %s",
+        BASE_URL
+    )
+
+    logger.info(
+        "======================================"
+    )
+
+    return runner
+
+
+# ============================================================
+# CLEANUP
+# ============================================================
+
+async def cleanup():
+    for key, item in list(
+        processes.items()
+    ):
+
+        try:
+
+            proc = item.get(
+                "process"
+            )
+
+            if (
+                proc
+                and proc.poll() is None
+            ):
+                proc.terminate()
+
+                try:
+                    proc.wait(
+                        timeout=3
+                    )
+                except Exception:
+                    proc.kill()
+
+            item[
+                "log_handle"
+            ].close()
+
+        except Exception:
+            pass
+
+    processes.clear()
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def main():
+async def main():
 
     if not BOT_TOKEN:
 
@@ -1752,89 +1973,109 @@ def main():
             "BOT_TOKEN environment variable is missing."
         )
 
-    print(
-        "================================"
+    logger.info(
+        "Starting PHP Hosting..."
     )
 
-    print(
-        "PHP HOSTING BOT"
-    )
+    # Web server FIRST
+    # Render will detect this port.
+    web_runner = await start_web()
 
-    print(
-        f"BASE_URL: {BASE_URL}"
-    )
-
-    print(
-        f"PORT: {PORT}"
-    )
-
-    print(
-        "================================"
-    )
-
-    web_thread = threading.Thread(
-        target=run_web_server,
-        daemon=True
-    )
-
-    web_thread.start()
-
-    application = (
+    app = (
         Application.builder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "start",
             start_command
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "upload",
-            upload_command
+            lambda update, context:
+            upload_command(
+                update,
+                context
+            )
         )
     )
 
-    application.add_handler(
-        CommandHandler(
-            "admin",
-            admin_command
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            callback_handler
-        )
-    )
-
-    application.add_handler(
+    app.add_handler(
         MessageHandler(
             filters.Document.ALL,
             document_handler
         )
     )
 
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT
-            & ~filters.COMMAND,
-            text_handler
+    app.add_handler(
+        CallbackQueryHandler(
+            callback_handler
         )
     )
 
-    print(
-        "Telegram bot starting..."
+    await app.initialize()
+
+    await app.start()
+
+    await app.updater.start_polling(
+        drop_pending_updates=True
     )
 
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES
+    logger.info(
+        "Telegram bot polling started."
     )
 
+    try:
+
+        await asyncio.Event().wait()
+
+    finally:
+
+        await cleanup()
+
+        try:
+            await app.updater.stop()
+        except Exception:
+            pass
+
+        try:
+            await app.stop()
+        except Exception:
+            pass
+
+        try:
+            await app.shutdown()
+        except Exception:
+            pass
+
+        await web_runner.cleanup()
+
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
-    main()
+
+    try:
+
+        asyncio.run(
+            main()
+        )
+
+    except KeyboardInterrupt:
+
+        pass
+
+    except Exception:
+
+        logger.exception(
+            "FATAL ERROR"
+        )
+
+        raise
