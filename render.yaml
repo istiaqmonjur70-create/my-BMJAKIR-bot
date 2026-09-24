@@ -1,8 +1,10 @@
 services:
   - type: web
-    name: my-bmjakir-bot-1
+    name: my-BMJAKIR-bot-1
     runtime: docker
+
     dockerfilePath: ./Dockerfile
+
     healthCheckPath: /health
 
     envVars:
@@ -14,6 +16,3 @@ services:
 
       - key: BASE_URL
         value: "https://my-bmjakir-bot-1.onrender.com"
-
-      - key: PORT
-        value: "10000"
