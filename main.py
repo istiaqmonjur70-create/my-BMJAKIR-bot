@@ -31,7 +31,7 @@ from telegram.ext import (
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8640062161:AAHOKHWzo0naxUpZRmNWdqGUKlYI3wjeXo0").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8752581017:AAGAIDxlKoAD-lAZc45avdumcGgYHhm3ia0").strip()
 
 ADMIN_ID = int(
     os.getenv("ADMIN_ID", "8814363793")
