@@ -1,2 +1,0 @@
-python-telegram-bot>=22.5,<23
-aiohttp>=3.10,<4
